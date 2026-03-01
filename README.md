@@ -112,6 +112,24 @@ python demo/server.py
 
 Features: voice clone (upload any WAV or use your microphone), voice design (1.7B-VoiceDesign model), streaming/non-streaming toggle, adjustable chunk size, live TTFA/RTF metrics, WAV download.
 
+## Fine-tuning for Saudi Arabic (ar-SA)
+
+This repository includes an end-to-end recipe for adapting Qwen3-TTS to **Saudi dialect Arabic** with SADA22 (Hugging Face primary source + Kaggle fallback), including download, preprocessing, dataset formatting, and training launchers for both **LoRA** and **full fine-tuning**.
+
+See [`docs/saudi_arabic_finetune.md`](docs/saudi_arabic_finetune.md) for the full workflow and extension notes for adding new languages/dialects.
+
+Quick validation on CPU (tiny subset + first training step):
+
+```bash
+scripts/saudi_arabic/smoke_test_pipeline.sh
+```
+
+GPU validation (CUDA required):
+
+```bash
+scripts/saudi_arabic/gpu_smoke_test.sh
+```
+
 ## Results
 
 Benchmarks include tokenization + inference (apples-to-apples with baseline). RTF > 1.0 = faster than real-time. TTFA measured as time to first playable audio chunk using streaming (chunk_size=8).
