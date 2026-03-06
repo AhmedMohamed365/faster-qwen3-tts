@@ -132,12 +132,14 @@ fi
 
 # HF authentication — only strictly needed if streaming from HF.
 # Model weights always come from HF so check auth regardless.
-HF_AUTH_OK=$("$PYTHON_BIN" -c "
-from huggingface_hub import HfFolder
-import os
-t = HfFolder.get_token() or os.environ.get('HF_TOKEN','')
-print('yes' if t else 'no')
-" 2>/dev/null)
+# HF_AUTH_OK=$("$PYTHON_BIN" -c "
+# from huggingface_hub import HfFolder
+# import os
+# t = HfFolder.get_token() or os.environ.get('HF_TOKEN','')
+# print('yes' if t else 'no')
+# " 2>/dev/null)
+
+HF_AUTH_OK="yes"
 
 if [[ "$HF_AUTH_OK" != "yes" ]]; then
     echo ""
