@@ -505,7 +505,7 @@ def main() -> None:
         logging_steps=logging_steps,
         save_strategy="steps",
         save_steps=save_steps,
-        evaluation_strategy="steps" if val_ds else "no",
+        eval_strategy="steps" if val_ds else "no",
         eval_steps=eval_steps if val_ds else None,
         report_to="none",       # no W&B / wandb needed
         load_best_model_at_end=False,
