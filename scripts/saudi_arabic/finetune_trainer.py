@@ -63,25 +63,42 @@ class Sada22SFTDataset(Dataset):
         self.records: list[dict[str, Any]] = []
         self.base_dir = base_dir or jsonl_path.parent
 
+        skipped = 0
         with jsonl_path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 rec = json.loads(line)
+                # Resolve audio path now so we can pre-validate existence
+                audio_path = Path(rec["audio"])
+                if not audio_path.is_absolute():
+                    audio_path = self.base_dir / audio_path
+                rec["_audio_abs"] = str(audio_path)
+                if not audio_path.exists():
+                    log.warning("Audio not found, dropping from dataset: %s", audio_path)
+                    skipped += 1
+                    continue
                 self.records.append(rec)
 
-        log.info("Loaded %d samples from %s", len(self.records), jsonl_path)
+        log.info(
+            "Loaded %d samples from %s%s",
+            len(self.records),
+            jsonl_path,
+            f" (skipped {skipped} missing-audio rows)" if skipped else "",
+        )
+        if not self.records:
+            raise RuntimeError(
+                f"No valid audio found for any sample in {jsonl_path}. "
+                "Check that the JSONL was rebuilt with absolute paths (run step [4/6] again)."
+            )
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rec = self.records[idx]
-        audio_path = Path(rec["audio"])
-        if not audio_path.is_absolute():
-            audio_path = self.base_dir / audio_path
-        return {"text": rec["text"], "audio_path": str(audio_path), "id": rec["id"]}
+        return {"text": rec["text"], "audio_path": rec["_audio_abs"], "id": rec["id"]}
 
 
 # ---------------------------------------------------------------------------
@@ -137,27 +154,46 @@ class TalkerCollator:
     def _encode_audio(self, wav: np.ndarray) -> torch.Tensor:
         """
         Returns codec IDs of shape [n_codebooks, T].
-        Handles both raw ndarray and tensor inputs from different speech_tokenizer
-        implementations found in qwen-tts releases.
+        Handles the various speech_tokenizer.encode() signatures found across
+        qwen-tts releases:
+          - encode(wav_np, sr=int)            ← preferred (numpy + sample rate)
+          - encode(wav_tensor [B,T])           ← tensor, no sr needed
+          - encode(wav_tensor_1d)              ← 1-D tensor fallback
+        The audio has already been resampled to TARGET_SR (24 kHz) by
+        load_audio_24k(), so we always pass sr=TARGET_SR.
         """
-        wav_t = torch.from_numpy(wav).float()
-        if wav_t.ndim == 1:
-            wav_t = wav_t.unsqueeze(0)  # [1, T]
-
         with torch.no_grad():
-            # Try the standard qwen-tts API
+            # ── Attempt 1: numpy array + explicit sr (newest qwen-tts API) ──
             try:
-                # speech_tokenizer.encode expects [B, T] or [T]
-                wav_on_device = wav_t.to(next(iter(self.speech_tok.parameters()), wav_t).device) if hasattr(self.speech_tok, 'parameters') else wav_t
-                codes = self.speech_tok.encode(wav_on_device)   # [n_codebooks, T]
+                codes = self.speech_tok.encode(wav, sr=TARGET_SR)
+            except TypeError:
+                pass
+            else:
+                if isinstance(codes, (list, tuple)):
+                    codes = codes[0]
+                if not isinstance(codes, torch.Tensor):
+                    codes = torch.tensor(codes)
+                return codes.long()
+
+            # ── Attempt 2: float tensor [B, T] ────────────────────────────
+            wav_t = torch.from_numpy(wav).float()
+            if wav_t.ndim == 1:
+                wav_t = wav_t.unsqueeze(0)  # [1, T]
+
+            dev = next(iter(self.speech_tok.parameters()), wav_t).device \
+                  if hasattr(self.speech_tok, "parameters") else wav_t.device
+            wav_on_device = wav_t.to(dev)
+            try:
+                codes = self.speech_tok.encode(wav_on_device)
             except Exception:
+                # ── Attempt 3: 1-D tensor ──────────────────────────────────
                 try:
-                    codes = self.speech_tok.encode(wav_t.squeeze(0))
+                    codes = self.speech_tok.encode(wav_on_device.squeeze(0))
                 except Exception as exc:
                     raise RuntimeError(f"speech_tokenizer.encode failed: {exc}") from exc
 
         if isinstance(codes, (list, tuple)):
-            codes = codes[0]  # some impls return (codes, lengths)
+            codes = codes[0]
         if not isinstance(codes, torch.Tensor):
             codes = torch.tensor(codes)
         return codes.long()  # [n_codebooks, T]
