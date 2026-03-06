@@ -151,52 +151,77 @@ class TalkerCollator:
             tts_end_ids = self.tok.convert_tokens_to_ids(["<|tts_eos|>"])
             self._tts_end = tts_end_ids[0] if tts_end_ids[0] != self.tok.unk_token_id else None
 
+    @staticmethod
+    def _unwrap_codes(codes_obj) -> torch.Tensor:
+        """
+        Extract integer codec codes from whatever speech_tokenizer.encode()
+        returns.  The qwen-tts library returns different types across versions:
+          - torch.Tensor                         → use directly
+          - tuple / list                         → first element is the tensor
+          - Qwen3TTSTokenizerV2EncoderOutput     → custom dataclass; look for the
+                                                   first tensor attribute by name
+        """
+        if isinstance(codes_obj, torch.Tensor):
+            return codes_obj.long()
+        if isinstance(codes_obj, (list, tuple)):
+            codes_obj = codes_obj[0]
+            if isinstance(codes_obj, torch.Tensor):
+                return codes_obj.long()
+
+        # Custom dataclass / named-tuple — try well-known attribute names first,
+        # then fall back to the first tensor we find in __dict__ / _fields.
+        for attr in ("codes", "token_ids", "indices", "vq_codes", "quantized_indices"):
+            val = getattr(codes_obj, attr, None)
+            if isinstance(val, torch.Tensor):
+                return val.long()
+
+        # Last resort: scan all attributes for a tensor
+        obj_dict = getattr(codes_obj, "__dict__", {})
+        if not obj_dict:
+            # e.g. NamedTuple uses _fields + _asdict
+            obj_dict = getattr(codes_obj, "_asdict", lambda: {})()
+        for val in obj_dict.values():
+            if isinstance(val, torch.Tensor):
+                return val.long()
+
+        raise RuntimeError(
+            f"Cannot extract codec codes from {type(codes_obj).__name__}. "
+            f"Attributes: {list(getattr(codes_obj, '__dict__', {}).keys())}"
+        )
+
     def _encode_audio(self, wav: np.ndarray) -> torch.Tensor:
         """
         Returns codec IDs of shape [n_codebooks, T].
-        Handles the various speech_tokenizer.encode() signatures found across
-        qwen-tts releases:
-          - encode(wav_np, sr=int)            ← preferred (numpy + sample rate)
-          - encode(wav_tensor [B,T])           ← tensor, no sr needed
-          - encode(wav_tensor_1d)              ← 1-D tensor fallback
-        The audio has already been resampled to TARGET_SR (24 kHz) by
-        load_audio_24k(), so we always pass sr=TARGET_SR.
+        Tries encode() signatures across qwen-tts versions, then unwraps
+        whatever object is returned via _unwrap_codes().
         """
         with torch.no_grad():
-            # ── Attempt 1: numpy array + explicit sr (newest qwen-tts API) ──
+            # ── Attempt 1: numpy array + explicit sr ──────────────────────
             try:
-                codes = self.speech_tok.encode(wav, sr=TARGET_SR)
+                codes_obj = self.speech_tok.encode(wav, sr=TARGET_SR)
+                return self._unwrap_codes(codes_obj)
             except TypeError:
-                pass
-            else:
-                if isinstance(codes, (list, tuple)):
-                    codes = codes[0]
-                if not isinstance(codes, torch.Tensor):
-                    codes = torch.tensor(codes)
-                return codes.long()
+                pass  # sr kwarg not accepted → try tensor API
 
             # ── Attempt 2: float tensor [B, T] ────────────────────────────
             wav_t = torch.from_numpy(wav).float()
             if wav_t.ndim == 1:
                 wav_t = wav_t.unsqueeze(0)  # [1, T]
-
-            dev = next(iter(self.speech_tok.parameters()), wav_t).device \
-                  if hasattr(self.speech_tok, "parameters") else wav_t.device
+            dev = (next(iter(self.speech_tok.parameters()), wav_t).device
+                   if hasattr(self.speech_tok, "parameters") else wav_t.device)
             wav_on_device = wav_t.to(dev)
             try:
-                codes = self.speech_tok.encode(wav_on_device)
+                codes_obj = self.speech_tok.encode(wav_on_device)
+                return self._unwrap_codes(codes_obj)
             except Exception:
-                # ── Attempt 3: 1-D tensor ──────────────────────────────────
-                try:
-                    codes = self.speech_tok.encode(wav_on_device.squeeze(0))
-                except Exception as exc:
-                    raise RuntimeError(f"speech_tokenizer.encode failed: {exc}") from exc
+                pass
 
-        if isinstance(codes, (list, tuple)):
-            codes = codes[0]
-        if not isinstance(codes, torch.Tensor):
-            codes = torch.tensor(codes)
-        return codes.long()  # [n_codebooks, T]
+            # ── Attempt 3: 1-D tensor ──────────────────────────────────────
+            try:
+                codes_obj = self.speech_tok.encode(wav_on_device.squeeze(0))
+                return self._unwrap_codes(codes_obj)
+            except Exception as exc:
+                raise RuntimeError(f"speech_tokenizer.encode failed: {exc}") from exc
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         input_ids_list = []
@@ -207,7 +232,16 @@ class TalkerCollator:
                 wav = load_audio_24k(item["audio_path"])
                 codes = self._encode_audio(wav)        # [n_codebooks, T]
             except Exception as exc:
-                log.warning("Skipping %s: %s", item["id"], exc)
+                # Log full traceback once so we can debug unknown return types
+                if not getattr(TalkerCollator, "_encode_error_logged", False):
+                    import traceback as _tb
+                    log.warning(
+                        "Skipping %s: %s\n%s",
+                        item["id"], exc, _tb.format_exc().strip()
+                    )
+                    TalkerCollator._encode_error_logged = True
+                else:
+                    log.warning("Skipping %s: %s", item["id"], exc)
                 continue
 
             # Tokenise text
