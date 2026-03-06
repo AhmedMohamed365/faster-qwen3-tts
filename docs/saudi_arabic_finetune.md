@@ -60,6 +60,15 @@ python scripts/saudi_arabic/download_sada22.py --source hf --output-dir data/sad
 ```
 
 For fast checks, limit rows:
+and also take 200 samples with specific speaker only  to get best accuracy 
+
+query on hugging face : 
+```
+SELECT audio, ProcessedText, SpeakerDialect, Speaker
+FROM train
+WHERE Speaker = 'Speaker1متحدث' AND SpeakerDialect = 'Najdi'
+LIMIT 200;
+```
 
 ```bash
 python scripts/saudi_arabic/download_sada22.py --source hf --max-samples 200 --output-dir data/sada22_small

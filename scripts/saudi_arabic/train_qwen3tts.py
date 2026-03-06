@@ -18,6 +18,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=Path("outputs/qwen3tts-sada22"))
     p.add_argument("--mode", choices=["full", "lora"], default="lora")
     p.add_argument("--epochs", type=int, default=3)
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=-1,
+        help="Override num_train_epochs with a fixed step budget. -1 means use --epochs.",
+    )
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=8)
@@ -54,16 +60,17 @@ def main() -> None:
         "validation_file": str(args.val_jsonl),
         "output_dir": str(args.output_dir),
         "num_train_epochs": args.epochs,
+        "max_steps": args.max_steps,
         "learning_rate": args.lr,
         "per_device_train_batch_size": args.batch_size,
         "gradient_accumulation_steps": args.grad_accum,
         "max_audio_seconds": args.max_seconds,
         "bf16": args.bf16,
         "save_strategy": "steps",
-        "save_steps": 500,
-        "logging_steps": 20,
+        "save_steps": max(10, args.max_steps // 2) if args.max_steps > 0 else 500,
+        "logging_steps": max(5, args.max_steps // 10) if args.max_steps > 0 else 20,
         "evaluation_strategy": "steps",
-        "eval_steps": 500,
+        "eval_steps": max(10, args.max_steps // 2) if args.max_steps > 0 else 500,
         "dialect": "ar-SA",
     }
 

@@ -1,0 +1,18 @@
+
+╔══════════════════════════════════════════════════════════╗
+║      Qwen3-TTS Saudi Arabic LoRA Fine-tune Pipeline      ║
+╚══════════════════════════════════════════════════════════╝
+
+  Speaker    : Speaker1متحدث
+  Dialect    : Najdi
+  Samples    : 200
+  Max steps  : 50
+  Base model : Qwen/Qwen3-TTS-0.6B-Base
+
+[1;33m▶ [1/7] Checking for uv package manager …[0m
+[0;32m✓ uv uv 0.10.2[0m
+[1;33m▶ [2/7] Creating virtual environment at .venv …[0m
+[0;32m✓ venv activated: /run/media/ahmed/temp/freelance-projects/arabic-text-to-speech/faster-qwen3-tts/.venv/bin/python[0m
+[1;33m▶ Installing core package (faster-qwen3-tts) …[0m
+error: Failed to install: scikit_learn-1.8.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (scikit-learn==1.8.0)
+  Caused by: failed to copy file from /home/ahmed/.cache/uv/archive-v0/UJ90ABt8FmbAd9swK_gId/sklearn/datasets/_lfw.py to /run/media/ahmed/temp/freelance-projects/arabic-text-to-speech/faster-qwen3-tts/.venv/lib/python3.11/site-packages/sklearn/datasets/_lfw.py: No space left on device (os error 28)

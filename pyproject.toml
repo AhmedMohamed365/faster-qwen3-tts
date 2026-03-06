@@ -40,6 +40,18 @@ demo = [
     "uvicorn[standard]>=0.24.0",
     "python-multipart>=0.0.7",
 ]
+train = [
+    "datasets>=2.14",
+    "accelerate>=0.26",
+    "peft>=0.10",
+    "torchaudio",
+    "soundfile",
+]
+
+[tool.uv]
+# To keep the venv on home (not a small temp drive), run:
+#   UV_PROJECT_ENVIRONMENT=~/venvs/qwen3tts-finetune uv sync --extra train
+# The run_pipeline_uv.sh script handles this automatically.
 
 [project.scripts]
 faster-qwen3-tts = "faster_qwen3_tts.cli:main"
