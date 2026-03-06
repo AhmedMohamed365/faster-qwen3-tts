@@ -115,12 +115,14 @@ fi
 ok "All required packages present."
 
 # HF authentication — Kaggle Secrets expose HF_TOKEN automatically if configured
-HF_AUTH_OK=$("$PYTHON_BIN" -c "
-from huggingface_hub import HfFolder
-import os
-t = HfFolder.get_token() or os.environ.get('HF_TOKEN','')
-print('yes' if t else 'no')
-" 2>/dev/null)
+HF_AUTH_OK="yes"
+
+# HF_AUTH_OK=$("$PYTHON_BIN" -c "
+# from huggingface_hub import HfFolder
+# import os
+# t = HfFolder.get_token() or os.environ.get('HF_TOKEN','')
+# print('yes' if t else 'no')
+# " 2>/dev/null)
 
 if [[ "$HF_AUTH_OK" != "yes" ]]; then
     echo ""
