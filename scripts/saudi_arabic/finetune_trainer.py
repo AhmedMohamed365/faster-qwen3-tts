@@ -308,14 +308,18 @@ class TalkerCollator:
 # Custom Trainer — builds inputs_embeds and computes official loss
 # ---------------------------------------------------------------------------
 
-def _make_trainer_class(text_embedding, codec_embedding, code_predictor):
+def _make_trainer_class(text_embedding, codec_embedding, code_predictor, text_projection):
     """
-    Create a HF Trainer subclass closed over the three sub-modules needed to
-    build inputs_embeds, following the official finetuning/sft_12hz.py recipe:
+    Create a HF Trainer subclass closed over the sub-modules needed to
+    build inputs_embeds, following the official finetuning/sft_12hz.py recipe.
 
-      input_text_embedding  = text_embedding(text_ids)  * text_embedding_mask  # (B,T,H)
-      input_codec_embedding = codec_embedding(codec_ids) * codec_embedding_mask # (B,T,H)
-      input_embeddings = input_text_embedding + input_codec_embedding
+    text_embedding  : Embedding(text_vocab_size, text_hidden_size=2048)
+    text_projection : MLP  2048 → hidden_size (1024)  — must be applied to text embeddings
+    codec_embedding : Embedding(vocab_size, hidden_size=1024)
+
+      text_emb  = text_projection(text_embedding(text_ids)) * text_embedding_mask  # (B,T,1024)
+      codec_emb = codec_embedding(codec_ids) * codec_embedding_mask                # (B,T,1024)
+      input_embeddings = text_emb + codec_emb
       # add codebooks 1-15 at codec positions
       for i in 1..15:
           input_embeddings += sub_emb[i-1](codec_ids[:,:,i]) * codec_mask
@@ -331,8 +335,9 @@ def _make_trainer_class(text_embedding, codec_embedding, code_predictor):
     from transformers import Trainer
 
     _text_emb   = text_embedding
+    _text_proj  = text_projection   # MLP: text_hidden_size (2048) → hidden_size (1024)
     _codec_emb  = codec_embedding
-    _code_pred  = code_predictor   # talker.code_predictor — for forward_sub_talker_finetune
+    _code_pred  = code_predictor
 
     class _Trainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -347,10 +352,11 @@ def _make_trainer_class(text_embedding, codec_embedding, code_predictor):
             text_ids_ch  = input_ids[:, :, 0]   # (B, T)
             codec_ids_ch = input_ids[:, :, 1]   # (B, T)
 
-            # ── Build inputs_embeds (official sft_12hz.py recipe) ──────────
-            text_emb  = _text_emb(text_ids_ch)   * text_emb_mask.float()   # (B,T,H)
-            codec_emb = _codec_emb(codec_ids_ch) * codec_emb_mask.float()  # (B,T,H)
-            # pos 6 = speaker slot: left as zeros (no ref audio in SA fine-tune)
+            # ── Build inputs_embeds ─────────────────────────────────────────
+            # text_embedding → text_hidden_size (2048); project to hidden_size (1024)
+            text_emb  = _text_proj(_text_emb(text_ids_ch)) * text_emb_mask.float()  # (B,T,1024)
+            codec_emb = _codec_emb(codec_ids_ch)           * codec_emb_mask.float() # (B,T,1024)
+            # pos 6 = speaker slot: zeroed (no ref audio in SA fine-tune)
             input_embeddings = text_emb + codec_emb
 
             # Add codebook embeddings 1..15 at codec positions
@@ -577,8 +583,9 @@ def main() -> None:
     #   model.talker.model.text_embedding / .codec_embedding
     #   model.talker.code_predictor
     talker_inner    = talker.model          # Qwen3TTSTalkerModel
-    text_embedding  = talker_inner.text_embedding
-    codec_embedding = talker_inner.codec_embedding
+    text_embedding  = talker_inner.text_embedding   # Embedding(text_vocab, 2048)
+    codec_embedding = talker_inner.codec_embedding  # Embedding(vocab, 1024)
+    text_projection = talker.text_projection        # MLP 2048 → 1024
     code_predictor  = talker.code_predictor
 
     if args.mode == "lora":
@@ -630,7 +637,7 @@ def main() -> None:
         label_names                 = ["codec_0_labels"],
     )
 
-    TrainerClass = _make_trainer_class(text_embedding, codec_embedding, code_predictor)
+    TrainerClass = _make_trainer_class(text_embedding, codec_embedding, code_predictor, text_projection)
     trainer = TrainerClass(
         model          = talker,
         args           = training_args,
