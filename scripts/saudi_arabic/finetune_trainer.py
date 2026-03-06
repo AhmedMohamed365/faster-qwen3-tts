@@ -114,31 +114,35 @@ class TalkerCollator:
       codec_0_labels   (B, T_seq)     — -100 everywhere except codec positions
     """
 
-    def __init__(self, text_tokenizer, speech_tokenizer) -> None:
+    def __init__(self, text_tokenizer, model_config) -> None:
+        """
+        model_config: the HuggingFace model config (Qwen3TTSConfig).
+          Text-channel IDs  → model_config.tts_pad/bos/eos_token_id
+          Codec-channel IDs → model_config.talker_config.codec_*
+        Mirrors faster_qwen3_tts/model.py:
+          m.config.tts_bos_token_id, m.config.talker_config.codec_pad_id, …
+        """
         self.tok = text_tokenizer
-        self.stok = speech_tokenizer
 
-        # ── Text-space special token IDs ──────────────────────────────────
-        def _tid(token: str, fallback: int) -> int:
-            ids = self.tok.convert_tokens_to_ids([token])
-            if ids and ids[0] != self.tok.unk_token_id:
-                return ids[0]
-            return fallback
+        cfg = model_config
+        tc  = cfg.talker_config
+        # If talker_config is a plain dict (rare), convert to namespace
+        if isinstance(tc, dict):
+            from types import SimpleNamespace
+            tc = SimpleNamespace(**tc)
 
-        self.tts_pad_id = _tid("<|tts_pad|>",  self.tok.pad_token_id or 0)
-        self.tts_bos_id = _tid("<|tts_bos|>",  self.tok.bos_token_id or 1)
-        self.tts_eos_id = _tid("<|tts_eos|>",  self.tok.eos_token_id or 2)
+        # ── Text-space special token IDs (from Qwen3TTSConfig) ────────────
+        self.tts_pad_id = cfg.tts_pad_token_id
+        self.tts_bos_id = cfg.tts_bos_token_id
+        self.tts_eos_id = cfg.tts_eos_token_id
 
-        # ── Codec-space special token IDs ─────────────────────────────────
-        def _cid(attr: str, fallback: int) -> int:
-            return int(getattr(self.stok, attr, fallback) or fallback)
-
-        self.codec_pad_id       = _cid("pad_token_id",        0)
-        self.codec_bos_id       = _cid("bos_token_id",        8193)
-        self.codec_eos_id       = _cid("eos_token_id",        8194)
-        self.codec_nothink_id   = _cid("nothink_token_id",    self.codec_pad_id)
-        self.codec_think_bos_id = _cid("think_bos_token_id",  self.codec_pad_id)
-        self.codec_think_eos_id = _cid("think_eos_token_id",  self.codec_pad_id)
+        # ── Codec-space special token IDs (from Qwen3TTSTalkerConfig) ─────
+        self.codec_pad_id       = tc.codec_pad_id
+        self.codec_bos_id       = tc.codec_bos_id
+        self.codec_eos_id       = tc.codec_eos_token_id
+        self.codec_nothink_id   = tc.codec_nothink_id
+        self.codec_think_bos_id = tc.codec_think_bos_id
+        self.codec_think_eos_id = tc.codec_think_eos_id
 
         log.info(
             "TalkerCollator special tokens — "
@@ -605,7 +609,8 @@ def main() -> None:
         args.val_jsonl and args.val_jsonl.exists()
     ) else None
 
-    collator = TalkerCollator(text_tok, speech_tok)
+    model_config = wrapper.model.config   # Qwen3TTSConfig — has tts_* and talker_config.*
+    collator = TalkerCollator(text_tok, model_config)
 
     # Training args
     from transformers import TrainingArguments
