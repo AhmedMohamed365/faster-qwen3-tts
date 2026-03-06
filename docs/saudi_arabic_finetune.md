@@ -117,7 +117,7 @@ python scripts/saudi_arabic/train_qwen3tts.py \
   --mode lora \
   --train-jsonl data/sada22_qwen3tts/train_qwen3tts_sft.jsonl \
   --val-jsonl data/sada22_qwen3tts/val_qwen3tts_sft.jsonl \
-  --base-model Qwen/Qwen3-TTS-0.6B-Base \
+  --base-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --output-dir outputs/qwen3tts-sada22-lora
 ```
 
@@ -128,7 +128,7 @@ python scripts/saudi_arabic/train_qwen3tts.py \
   --mode full \
   --train-jsonl data/sada22_qwen3tts/train_qwen3tts_sft.jsonl \
   --val-jsonl data/sada22_qwen3tts/val_qwen3tts_sft.jsonl \
-  --base-model Qwen/Qwen3-TTS-0.6B-Base \
+  --base-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --output-dir outputs/qwen3tts-sada22-full
 ```
 
@@ -162,7 +162,7 @@ The final command in that script is a dry run, so it prints the exact training c
 
 ## 12) Practical defaults
 
-- Start from `Qwen/Qwen3-TTS-0.6B-Base` for faster iteration.
+- Start from `Qwen/Qwen3-TTS-12Hz-0.6B-Base` for faster iteration.
 - Use LoRA (`r=64`) first; upgrade rank if underfitting.
 - Keep `max_audio_seconds` around 12–16 for stability and memory.
 - Use bf16 on Ampere/Hopper GPUs.
