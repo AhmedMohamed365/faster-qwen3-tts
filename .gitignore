@@ -6,3 +6,4 @@ sample_*.wav
 __pycache__/
 *.pyc
 .venv/
+.venv

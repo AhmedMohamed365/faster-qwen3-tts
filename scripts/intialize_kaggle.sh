@@ -52,6 +52,10 @@ else
 fi
 
 # ── 4. Install PyTorch (CUDA 12.x) ───────────────────────────────────────────
+info "Installing system deps (sox, ffmpeg) …"
+apt-get install -y -q sox libsox-fmt-all ffmpeg 2>/dev/null || true
+ok "System deps ready"
+
 info "Installing PyTorch (cu121) …"
 "$PIP" install --quiet torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu121

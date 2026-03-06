@@ -54,6 +54,21 @@ export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
 mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
 
+# Sync HF token: the notebook's huggingface_hub.login() writes to
+# ~/.cache/huggingface/token, but HF_HOME is overridden above to a different
+# path, so huggingface_hub looks in the wrong place and gets 401.
+# Fix: read token from the default location and export it as HF_TOKEN so
+# every subprocess (finetune_trainer, validate, etc.) can authenticate.
+DEFAULT_TOKEN_FILE="$HOME/.cache/huggingface/token"
+if [[ -z "${HF_TOKEN:-}" && -f "$DEFAULT_TOKEN_FILE" ]]; then
+    export HF_TOKEN="$(cat "$DEFAULT_TOKEN_FILE")"
+fi
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    # Also write into the overridden HF_HOME so huggingface_hub finds it there
+    mkdir -p "$HF_HOME"
+    echo "$HF_TOKEN" > "$HF_HOME/token"
+fi
+
 # Navigate to repo root
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"

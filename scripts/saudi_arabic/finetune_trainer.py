@@ -255,10 +255,16 @@ def load_model_and_components(base_model: str, bf16: bool):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if bf16 else torch.float32
 
+    # Pass token explicitly so the model loads even when HF_HOME is
+    # overridden (token may be in HF_TOKEN env var rather than the cache).
+    import os as _os
+    _hf_token = _os.environ.get("HF_TOKEN") or None
+
     wrapper = Qwen3TTSModel.from_pretrained(
         base_model,
         torch_dtype=dtype,
         device_map=device,
+        token=_hf_token,
     )
 
     full_model = wrapper.model  # Qwen3TTSForConditionalGeneration
