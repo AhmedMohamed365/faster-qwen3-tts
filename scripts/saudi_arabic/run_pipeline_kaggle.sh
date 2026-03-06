@@ -250,9 +250,11 @@ VAL_JSONL="$DATA_PROCESSED/val_qwen3tts_sft.jsonl"
 # Always rebuild JSONL so audio paths are absolute and correct for this run's
 # working directory (avoids stale relative-path issues from a previous run).
 run_py scripts/saudi_arabic/build_qwen3tts_sft_jsonl.py \
-    --manifest "$DATA_PROCESSED/train_manifest.jsonl" --output "$TRAIN_JSONL"
+    --manifest "$DATA_PROCESSED/train_manifest.jsonl" --output "$TRAIN_JSONL" \
+    --base-model "$BASE_MODEL"
 run_py scripts/saudi_arabic/build_qwen3tts_sft_jsonl.py \
-    --manifest "$DATA_PROCESSED/val_manifest.jsonl"   --output "$VAL_JSONL"
+    --manifest "$DATA_PROCESSED/val_manifest.jsonl"   --output "$VAL_JSONL" \
+    --base-model "$BASE_MODEL"
 
 ok "[4/6] SFT JSONL: $(wc -l < "$TRAIN_JSONL") train / $(wc -l < "$VAL_JSONL") val rows"
 disk_check

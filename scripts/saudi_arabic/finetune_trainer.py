@@ -1,456 +1,452 @@
 #!/usr/bin/env python3
 """
-Standalone HuggingFace-Trainer fallback fine-tuner for Qwen3-TTS.
+Standalone HuggingFace-Trainer fine-tuner for Qwen3-TTS (12Hz).
 
-Used when `qwen_tts.finetune.train_sft` is not found in the installed
-version of qwen-tts.  Applies LoRA (or full fine-tuning) to the talker LM
-using the transformers Trainer + PEFT.
+Uses the official dual-channel sequence format from the Qwen3-TTS
+finetuning/dataset.py recipe:
+  - audio_codes are pre-encoded by build_qwen3tts_sft_jsonl.py
+  - input_ids shape (B, T, 2): channel 0 = text IDs, channel 1 = codec IDs
+  - Main loss = CE on codebook-0 tokens; sub-talker loss = CE on codebooks 1-15
 
-Usage (mirrors train_qwen3tts.py CLI):
-    python scripts/saudi_arabic/finetune_trainer.py \
-        --config outputs/qwen3tts-sada22-lora/train_config_lora.json
-
-Or directly:
-    python scripts/saudi_arabic/finetune_trainer.py \
-        --train-jsonl data/sada22_small_qwen3tts/train_qwen3tts_sft.jsonl \
-        --val-jsonl   data/sada22_small_qwen3tts/val_qwen3tts_sft.jsonl \
-        --base-model  Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-        --output-dir  outputs/qwen3tts-sada22-lora \
-        --max-steps   50 \
-        --mode        lora \
-        --bf16
+Usage:
+    python scripts/saudi_arabic/finetune_trainer.py \\
+        --train-jsonl data/sada22_small_qwen3tts/train_qwen3tts_sft.jsonl \\
+        --val-jsonl   data/sada22_small_qwen3tts/val_qwen3tts_sft.jsonl \\
+        --base-model  Qwen/Qwen3-TTS-12Hz-0.6B-Base \\
+        --output-dir  outputs/qwen3tts-sada22-lora \\
+        --max-steps   50 --mode lora --bf16
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
-import math
 import os
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-import soundfile as sf
 import torch
 from torch.utils.data import Dataset
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TARGET_SR = 24_000
-MAX_AUDIO_SECONDS = 16.0
-MAX_TEXT_TOKENS = 256
-CODEBOOK_SIZE = 4096  # Qwen3-TTS speech tokenizer vocab per codebook
+NUM_CODEBOOKS = 16   # Qwen3-TTS uses 16 RVQ codebooks
+SUB_TALKER_LOSS_WEIGHT = 0.3   # from official finetuning/train.py
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset — reads pre-encoded audio_codes from JSONL
 # ---------------------------------------------------------------------------
 
 class Sada22SFTDataset(Dataset):
     """
     Reads SFT JSONL produced by build_qwen3tts_sft_jsonl.py.
-
-    Each record has:  id, audio (path), text, messages, metadata
-
-    We return (text, audio_path) pairs; collation handles tokenization.
+    Each record must have: id, text, audio_codes (List[T × 16 ints]).
+    Audio I/O happens at step [4/6] (build_qwen3tts_sft_jsonl.py), not here.
     """
 
-    def __init__(self, jsonl_path: Path, base_dir: Optional[Path] = None) -> None:
+    def __init__(self, jsonl_path: Path) -> None:
         self.records: list[dict[str, Any]] = []
-        self.base_dir = base_dir or jsonl_path.parent
+        missing_codes = 0
 
-        skipped = 0
         with jsonl_path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 rec = json.loads(line)
-                # Resolve audio path now so we can pre-validate existence
-                audio_path = Path(rec["audio"])
-                if not audio_path.is_absolute():
-                    audio_path = self.base_dir / audio_path
-                rec["_audio_abs"] = str(audio_path)
-                if not audio_path.exists():
-                    log.warning("Audio not found, dropping from dataset: %s", audio_path)
-                    skipped += 1
+                if not rec.get("audio_codes"):
+                    missing_codes += 1
                     continue
                 self.records.append(rec)
 
-        log.info(
-            "Loaded %d samples from %s%s",
-            len(self.records),
-            jsonl_path,
-            f" (skipped {skipped} missing-audio rows)" if skipped else "",
-        )
+        if missing_codes:
+            log.warning(
+                "%d rows in %s have no audio_codes — skipped. "
+                "Re-run step [4/6] (build_qwen3tts_sft_jsonl.py) to encode them.",
+                missing_codes, jsonl_path,
+            )
         if not self.records:
             raise RuntimeError(
-                f"No valid audio found for any sample in {jsonl_path}. "
-                "Check that the JSONL was rebuilt with absolute paths (run step [4/6] again)."
+                f"No valid records in {jsonl_path}. "
+                "Run step [4/6] first to pre-encode audio codes."
             )
+        log.info("Loaded %d samples from %s", len(self.records), jsonl_path)
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rec = self.records[idx]
-        return {"text": rec["text"], "audio_path": rec["_audio_abs"], "id": rec["id"]}
+        return {
+            "id":          rec["id"],
+            "text":        rec["text"],
+            "audio_codes": rec["audio_codes"],  # List[T × 16 ints]
+        }
 
 
 # ---------------------------------------------------------------------------
-# Audio helpers
-# ---------------------------------------------------------------------------
-
-def load_audio_24k(path: str) -> np.ndarray:
-    wav, sr = sf.read(path, dtype="float32")
-    if wav.ndim == 2:
-        wav = wav.mean(axis=1)
-    if sr != TARGET_SR:
-        src_t = np.linspace(0, 1, len(wav), endpoint=False)
-        dst_n = int(math.ceil(len(wav) * TARGET_SR / sr))
-        dst_t = np.linspace(0, 1, dst_n, endpoint=False)
-        wav = np.interp(dst_t, src_t, wav).astype(np.float32)
-    # Clip to max length
-    max_samples = int(MAX_AUDIO_SECONDS * TARGET_SR)
-    wav = wav[:max_samples]
-    return wav
-
-
-# ---------------------------------------------------------------------------
-# Collator: builds model inputs from (text, audio_path) pairs
+# Collator — builds official dual-channel sequence
 # ---------------------------------------------------------------------------
 
 class TalkerCollator:
     """
-    Tokenises text with the Qwen3-TTS thinker tokenizer,
-    encodes audio to codec tokens via the speech tokenizer,
-    and builds input_ids + labels for causal-LM training.
+    Mirrors finetuning/dataset.py from the official Qwen3-TTS repo.
 
-    The sequence layout (flattened over codebooks 1..16 interleaved):
-        [text_token_ids ...] [task_token] [codec_flat ...] [eos]
+    Sequence layout per sample (T_seq = 8 + L + T tokens):
+      Pos  0-2    :  text_ids[0:3]       | 0, 0, 0             (prefix: im_start, assistant, \\n)
+      Pos  3-5    :  tts_pad × 3         | nothink, think_bos, think_eos  (codec think tokens)
+      Pos  6      :  tts_pad             | 0                              (speaker slot — zeroed)
+      Pos  7      :  tts_bos             | codec_pad                      (TTS start)
+      Pos  8..5+L :  text_ids[3:]        | codec_pad × (L-3)              (rest of text)
+      Pos  6+L    :  tts_eos             | codec_pad                      (TTS end)
+      Pos  7+L    :  tts_pad             | codec_bos                      (codec start marker)
+      Pos  8+L..  :  tts_pad × T        | codes_col0[0..T-1]             (codebook-0)
+      Pos  8+L+T  :  tts_pad             | codec_eos                      (codec end)
 
-    Only codec tokens are used in the loss (text tokens → -100).
+    batch keys returned:
+      input_ids        (B, T_seq, 2)  — channel 0 = text, channel 1 = codec
+      attention_mask   (B, T_seq)
+      codec_ids        (B, T_seq, 16) — all 16 codebooks (zeros outside codec region)
+      codec_0_labels   (B, T_seq)     — -100 everywhere except codec positions
     """
 
-    def __init__(self, thinker_tokenizer, speech_tokenizer, device: str = "cpu") -> None:
-        self.tok = thinker_tokenizer
-        self.speech_tok = speech_tokenizer
-        self.device = device
+    def __init__(self, text_tokenizer, speech_tokenizer) -> None:
+        self.tok = text_tokenizer
+        self.stok = speech_tokenizer
 
-        # Special tokens used by qwen-tts (best-effort; fall back to generic)
-        self._tts_start = getattr(self.tok, "tts_start_token_id", None)
-        self._tts_end = getattr(self.tok, "tts_end_token_id", None)
-        if self._tts_start is None:
-            tts_start_ids = self.tok.convert_tokens_to_ids(["<|tts_bos|>"])
-            self._tts_start = tts_start_ids[0] if tts_start_ids[0] != self.tok.unk_token_id else None
-        if self._tts_end is None:
-            tts_end_ids = self.tok.convert_tokens_to_ids(["<|tts_eos|>"])
-            self._tts_end = tts_end_ids[0] if tts_end_ids[0] != self.tok.unk_token_id else None
+        # ── Text-space special token IDs ──────────────────────────────────
+        def _tid(token: str, fallback: int) -> int:
+            ids = self.tok.convert_tokens_to_ids([token])
+            if ids and ids[0] != self.tok.unk_token_id:
+                return ids[0]
+            return fallback
 
-    @staticmethod
-    def _unwrap_codes(codes_obj) -> torch.Tensor:
-        """
-        Extract integer codec codes from whatever speech_tokenizer.encode()
-        returns.  The qwen-tts library returns different types across versions:
-          - torch.Tensor                         → use directly
-          - tuple / list                         → first element is the tensor
-          - Qwen3TTSTokenizerV2EncoderOutput     → custom dataclass; look for the
-                                                   first tensor attribute by name
-        """
-        if isinstance(codes_obj, torch.Tensor):
-            return codes_obj.long()
-        if isinstance(codes_obj, (list, tuple)):
-            codes_obj = codes_obj[0]
-            if isinstance(codes_obj, torch.Tensor):
-                return codes_obj.long()
+        self.tts_pad_id = _tid("<|tts_pad|>",  self.tok.pad_token_id or 0)
+        self.tts_bos_id = _tid("<|tts_bos|>",  self.tok.bos_token_id or 1)
+        self.tts_eos_id = _tid("<|tts_eos|>",  self.tok.eos_token_id or 2)
 
-        # Custom dataclass / named-tuple — try well-known attribute names first,
-        # then fall back to the first tensor we find in __dict__ / _fields.
-        for attr in ("codes", "token_ids", "indices", "vq_codes", "quantized_indices"):
-            val = getattr(codes_obj, attr, None)
-            if isinstance(val, torch.Tensor):
-                return val.long()
+        # ── Codec-space special token IDs ─────────────────────────────────
+        def _cid(attr: str, fallback: int) -> int:
+            return int(getattr(self.stok, attr, fallback) or fallback)
 
-        # Last resort: scan all attributes for a tensor
-        obj_dict = getattr(codes_obj, "__dict__", {})
-        if not obj_dict:
-            # e.g. NamedTuple uses _fields + _asdict
-            obj_dict = getattr(codes_obj, "_asdict", lambda: {})()
-        for val in obj_dict.values():
-            if isinstance(val, torch.Tensor):
-                return val.long()
+        self.codec_pad_id       = _cid("pad_token_id",        0)
+        self.codec_bos_id       = _cid("bos_token_id",        8193)
+        self.codec_eos_id       = _cid("eos_token_id",        8194)
+        self.codec_nothink_id   = _cid("nothink_token_id",    self.codec_pad_id)
+        self.codec_think_bos_id = _cid("think_bos_token_id",  self.codec_pad_id)
+        self.codec_think_eos_id = _cid("think_eos_token_id",  self.codec_pad_id)
 
-        raise RuntimeError(
-            f"Cannot extract codec codes from {type(codes_obj).__name__}. "
-            f"Attributes: {list(getattr(codes_obj, '__dict__', {}).keys())}"
+        log.info(
+            "TalkerCollator special tokens — "
+            "tts_pad=%d tts_bos=%d tts_eos=%d | "
+            "codec_pad=%d codec_bos=%d codec_eos=%d",
+            self.tts_pad_id, self.tts_bos_id, self.tts_eos_id,
+            self.codec_pad_id, self.codec_bos_id, self.codec_eos_id,
         )
 
-    def _encode_audio(self, wav: np.ndarray) -> torch.Tensor:
+    def _build_text_ids(self, text: str) -> list[int]:
         """
-        Returns codec IDs of shape [n_codebooks, T].
-        Tries encode() signatures across qwen-tts versions, then unwraps
-        whatever object is returned via _unwrap_codes().
+        Tokenise the instruction text and return token IDs with last-5 dropped.
+        Prompt: <|im_start|>assistant\\n{text}<|im_end|>\\n<|im_start|>assistant\\n
         """
-        with torch.no_grad():
-            # ── Attempt 1: numpy array + explicit sr ──────────────────────
-            try:
-                codes_obj = self.speech_tok.encode(wav, sr=TARGET_SR)
-                return self._unwrap_codes(codes_obj)
-            except TypeError:
-                pass  # sr kwarg not accepted → try tensor API
+        prompt = (
+            f"<|im_start|>assistant\n{text}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        ids = self.tok(
+            prompt,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).input_ids[0].tolist()
+        return ids[:-5] if len(ids) > 5 else ids   # drop trailing 5 tokens (official recipe)
 
-            # ── Attempt 2: float tensor [B, T] ────────────────────────────
-            wav_t = torch.from_numpy(wav).float()
-            if wav_t.ndim == 1:
-                wav_t = wav_t.unsqueeze(0)  # [1, T]
-            dev = (next(iter(self.speech_tok.parameters()), wav_t).device
-                   if hasattr(self.speech_tok, "parameters") else wav_t.device)
-            wav_on_device = wav_t.to(dev)
-            try:
-                codes_obj = self.speech_tok.encode(wav_on_device)
-                return self._unwrap_codes(codes_obj)
-            except Exception:
-                pass
+    def _build_sample(
+        self,
+        text_ids: list[int],
+        audio_codes: list[list[int]],   # List[T × 16 ints]
+    ) -> tuple[list, list, list, list]:
+        """
+        Returns (text_channel, codec_channel, codec_ids_flat, labels) each length T_seq.
+          codec_ids_flat: List[16 ints] per position (zeros outside codec region)
+          labels:  -100 outside codec region, codec col-0 value at codec positions
+        """
+        L = len(text_ids)
+        T = len(audio_codes)
 
-            # ── Attempt 3: 1-D tensor ──────────────────────────────────────
-            try:
-                codes_obj = self.speech_tok.encode(wav_on_device.squeeze(0))
-                return self._unwrap_codes(codes_obj)
-            except Exception as exc:
-                raise RuntimeError(f"speech_tokenizer.encode failed: {exc}") from exc
+        p   = self.tts_pad_id
+        bos = self.tts_bos_id
+        eos = self.tts_eos_id
+        cp  = self.codec_pad_id
+        cb  = self.codec_bos_id
+        ce  = self.codec_eos_id
+        cn  = self.codec_nothink_id
+        ctb = self.codec_think_bos_id
+        cte = self.codec_think_eos_id
+
+        _ZEROS_16 = [0] * NUM_CODEBOOKS
+        _PAD_16   = [cp] + [0] * (NUM_CODEBOOKS - 1)  # pad only codebook-0
+
+        # Build channels position by position (matches official dataset.py layout)
+        text_ch:  list[int]       = []
+        codec_ch: list[int]       = []
+        cids:     list[list[int]] = []
+        labels:   list[int]       = []
+
+        # Pos 0-2: first 3 text tokens, codec channel = 0
+        for tok_id in text_ids[:3]:
+            text_ch.append(tok_id);  codec_ch.append(0);  cids.append(_ZEROS_16);  labels.append(-100)
+
+        # Pos 3-5: think tokens in codec channel
+        for c in (cn, ctb, cte):
+            text_ch.append(p);  codec_ch.append(c);  cids.append(_ZEROS_16);  labels.append(-100)
+
+        # Pos 6: speaker slot (zeroed — no speaker encoder)
+        text_ch.append(p);  codec_ch.append(0);  cids.append(_ZEROS_16);  labels.append(-100)
+
+        # Pos 7: tts_bos | codec_pad
+        text_ch.append(bos);  codec_ch.append(cp);  cids.append(_ZEROS_16);  labels.append(-100)
+
+        # Pos 8 .. 8+(L-3)-1 = 8+L-4: text_ids[3:] | codec_pad
+        for tok_id in text_ids[3:]:
+            text_ch.append(tok_id);  codec_ch.append(cp);  cids.append(_ZEROS_16);  labels.append(-100)
+
+        # Pos 8+L-3: tts_eos | codec_pad
+        text_ch.append(eos);  codec_ch.append(cp);  cids.append(_ZEROS_16);  labels.append(-100)
+
+        # Pos 8+L-2: tts_pad | codec_bos (codec sequence starts)
+        text_ch.append(p);  codec_ch.append(cb);  cids.append(_ZEROS_16);  labels.append(-100)
+
+        # Pos 8+L-1 .. 8+L-1+T-1: tts_pad | codec col-0; codec_ids = full 16-book row
+        for frame in audio_codes:
+            text_ch.append(p)
+            codec_ch.append(frame[0])             # codebook-0 in codec channel
+            cids.append(list(frame))              # all 16 codebooks
+            labels.append(frame[0])              # CE loss on codebook-0
+
+        # Pos 8+L-1+T: tts_pad | codec_eos  (predict EOS as final label)
+        text_ch.append(p);  codec_ch.append(ce);  cids.append(_ZEROS_16);  labels.append(ce)
+
+        return text_ch, codec_ch, cids, labels
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        input_ids_list = []
-        labels_list = []
+        all_text_ch:  list[torch.Tensor] = []
+        all_codec_ch: list[torch.Tensor] = []
+        all_cids:     list[torch.Tensor] = []    # (T_seq, 16) per sample
+        all_labels:   list[torch.Tensor] = []
 
         for item in batch:
-            try:
-                wav = load_audio_24k(item["audio_path"])
-                codes = self._encode_audio(wav)        # [n_codebooks, T]
-            except Exception as exc:
-                # Log full traceback once so we can debug unknown return types
-                if not getattr(TalkerCollator, "_encode_error_logged", False):
-                    import traceback as _tb
-                    log.warning(
-                        "Skipping %s: %s\n%s",
-                        item["id"], exc, _tb.format_exc().strip()
-                    )
-                    TalkerCollator._encode_error_logged = True
-                else:
-                    log.warning("Skipping %s: %s", item["id"], exc)
-                continue
+            text_ids    = self._build_text_ids(item["text"])
+            audio_codes = item["audio_codes"]
 
-            # Tokenise text
-            text_ids = self.tok(
-                item["text"],
-                add_special_tokens=True,
-                max_length=MAX_TEXT_TOKENS,
-                truncation=True,
-            ).input_ids
+            tc, cc, cids, labs = self._build_sample(text_ids, audio_codes)
 
-            # Flatten codec tokens: interleave codebooks column-by-column → [n_codebooks * T]
-            # (simple approach: concatenate codebook-0 then codebook-1 ... )
-            codec_flat = codes.flatten().tolist()   # [n_codebooks * T]
+            all_text_ch.append(torch.tensor(tc,   dtype=torch.long))
+            all_codec_ch.append(torch.tensor(cc,  dtype=torch.long))
+            all_cids.append(torch.tensor(cids,    dtype=torch.long))  # (T_seq, 16)
+            all_labels.append(torch.tensor(labs,  dtype=torch.long))
 
-            # Shift codec IDs into a separate vocab range if the model uses them inline.
-            # For Qwen3-TTS the speech vocab is offset from text vocab; we use
-            # the raw codec IDs here since the talker head maps 0..4095 codec space.
-            # (finetune_trainer trains the talker directly; text tokens are frozen.)
+        # Pad everything to the longest sequence in the batch
+        max_len = max(t.size(0) for t in all_text_ch)
+        pad_tok  = self.tts_pad_id
+        pad_cid  = self.codec_pad_id
 
-            seq_ids: list[int] = []
-            seq_ids.extend(text_ids)
-            if self._tts_start is not None:
-                seq_ids.append(self._tts_start)
-            seq_ids.extend(codec_flat)
-            if self._tts_end is not None:
-                seq_ids.append(self._tts_end)
+        def _pad(t: torch.Tensor, pad_val: int, target_len: int) -> torch.Tensor:
+            diff = target_len - t.size(0)
+            if diff == 0:
+                return t
+            padding = torch.full((diff,), pad_val, dtype=torch.long)
+            return torch.cat([t, padding], dim=0)
 
-            # Labels: mask text portion with -100; only compute loss on codec tokens
-            lab_ids: list[int] = [-100] * len(text_ids)
-            if self._tts_start is not None:
-                lab_ids.append(-100)            # don't predict the task start token
-            lab_ids.extend(codec_flat)
-            if self._tts_end is not None:
-                lab_ids.append(self._tts_end)
+        def _pad_cids(t: torch.Tensor, target_len: int) -> torch.Tensor:
+            diff = target_len - t.size(0)
+            if diff == 0:
+                return t
+            padding = torch.zeros(diff, NUM_CODEBOOKS, dtype=torch.long)
+            return torch.cat([t, padding], dim=0)
 
-            input_ids_list.append(torch.tensor(seq_ids, dtype=torch.long))
-            labels_list.append(torch.tensor(lab_ids, dtype=torch.long))
+        text_ch_padded  = torch.stack([_pad(t, pad_tok,  max_len) for t in all_text_ch])   # (B, T)
+        codec_ch_padded = torch.stack([_pad(t, pad_cid,  max_len) for t in all_codec_ch])  # (B, T)
+        cids_padded     = torch.stack([_pad_cids(t,      max_len) for t in all_cids])       # (B, T, 16)
+        labels_padded   = torch.stack([_pad(t, -100,     max_len) for t in all_labels])     # (B, T)
 
-        if not input_ids_list:
-            # All samples in this batch failed to load — return a zero-loss
-            # placeholder so Trainer doesn't crash.  Using a real pad_token_id
-            # keeps input valid for the model; all-(-100) labels means no
-            # gradient is computed and the step is effectively a no-op.
-            pad_id = self.tok.pad_token_id or 0
-            dummy = torch.full((1, 4), pad_id, dtype=torch.long)
-            return {
-                "input_ids": dummy,
-                "labels": torch.full((1, 4), -100, dtype=torch.long),
-                "attention_mask": torch.ones(1, 4, dtype=torch.long),
-            }
+        # Dual-channel input: (B, T, 2)
+        input_ids = torch.stack([text_ch_padded, codec_ch_padded], dim=-1)  # (B, T, 2)
 
-        # Pad to longest in batch
-        max_len = max(t.size(0) for t in input_ids_list)
-        pad_id = self.tok.pad_token_id or 0
+        attention_mask = (text_ch_padded != pad_tok).long()
 
-        input_ids = torch.stack(
-            [torch.nn.functional.pad(t, (0, max_len - t.size(0)), value=pad_id) for t in input_ids_list]
-        )
-        labels = torch.stack(
-            [torch.nn.functional.pad(t, (0, max_len - t.size(0)), value=-100) for t in labels_list]
-        )
-        attention_mask = (input_ids != pad_id).long()
-
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+        return {
+            "input_ids":      input_ids,       # (B, T, 2)
+            "attention_mask": attention_mask,   # (B, T)
+            "codec_ids":      cids_padded,      # (B, T, 16)
+            "codec_0_labels": labels_padded,    # (B, T)
+        }
 
 
 # ---------------------------------------------------------------------------
-# Model loading helpers
+# Custom Trainer — passes dual-channel inputs, computes official loss
+# ---------------------------------------------------------------------------
+
+class Qwen3TTSTrainer:
+    """
+    Thin wrapper around the HF Trainer that overrides compute_loss to use
+    the Qwen3-TTS dual-channel training forward.
+
+    Forward call (mirrors official finetuning/train.py):
+      outputs = talker(
+          input_ids      = input_ids[:, :-1, :],      # (B, T-1, 2), shift for CLM
+          attention_mask = attention_mask[:, :-1],
+          labels         = codec_0_labels[:, 1:],      # (B, T-1), shift left
+          output_hidden_states = True,
+      )
+      loss = outputs.loss + SUB_TALKER_LOSS_WEIGHT * sub_talker_loss
+
+    Sub-talker loss: codebooks 1-15 predicted from main talker hidden states.
+    """
+
+    @staticmethod
+    def compute_loss_fn(model, inputs, return_outputs=False, num_items_in_batch=None):
+        input_ids      = inputs["input_ids"]       # (B, T, 2)
+        attention_mask = inputs["attention_mask"]  # (B, T)
+        codec_ids      = inputs["codec_ids"]       # (B, T, 16)
+        codec_0_labels = inputs["codec_0_labels"]  # (B, T)
+
+        # Standard CLM shift: predict token t from tokens 0..t-1
+        outputs = model(
+            input_ids      = input_ids[:, :-1, :],
+            attention_mask = attention_mask[:, :-1],
+            labels         = codec_0_labels[:, 1:],
+            output_hidden_states=True,
+        )
+        loss = outputs.loss
+
+        # Sub-talker loss (codebooks 1–15)
+        try:
+            hidden = outputs.hidden_states[-1]        # (B, T-1, H) last layer
+            codec_mask = (codec_0_labels[:, 1:] != -100)  # (B, T-1) — codec positions
+
+            talker_hidden = hidden[codec_mask]         # (N, H)
+            talker_cids   = codec_ids[:, 1:][codec_mask]  # (N, 16)
+
+            if talker_hidden.numel() > 0:
+                _, sub_loss = model.forward_sub_talker_finetune(talker_cids, talker_hidden)
+                loss = loss + SUB_TALKER_LOSS_WEIGHT * sub_loss
+        except Exception as e:
+            # sub-talker loss is optional; don't crash if unavailable
+            log.debug("Sub-talker loss skipped: %s", e)
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+
+def _make_trainer_class():
+    """Dynamically create a Trainer subclass that uses Qwen3TTSTrainer.compute_loss_fn."""
+    from transformers import Trainer
+
+    class _Trainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            return Qwen3TTSTrainer.compute_loss_fn(
+                model, inputs, return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+    return _Trainer
+
+
+# ---------------------------------------------------------------------------
+# Model loading + cache fixes
 # ---------------------------------------------------------------------------
 
 def _ensure_speech_tokenizer_preprocessor(snapshot_dir: str) -> None:
-    """
-    Work-around for a qwen_tts bug on Kaggle / local HF cache:
-
-    AutoFeatureExtractor.from_pretrained(snapshot_dir) resolves the model
-    to the *speech_tokenizer/* sub-directory and then looks for
-    preprocessor_config.json inside that sub-directory.  On some versions of
-    the qwen-tts library / transformers the file is only present at the root
-    of the snapshot, not inside speech_tokenizer/, which triggers:
-
-        OSError: Can't load feature extractor … make sure '…/speech_tokenizer'
-                 is the correct path to a directory containing a
-                 preprocessor_config.json file
-
-    Fix: if preprocessor_config.json is absent from speech_tokenizer/ but
-    present at the root of the snapshot, copy (or symlink) it across.
-    """
-    import shutil as _shutil
+    """Copy preprocessor_config.json into speech_tokenizer/ if missing (HF cache bug)."""
+    import shutil
     snapshot = Path(snapshot_dir)
     root_cfg = snapshot / "preprocessor_config.json"
     sub_dir  = snapshot / "speech_tokenizer"
     sub_cfg  = sub_dir / "preprocessor_config.json"
-
-    if not sub_dir.is_dir():
-        return  # nothing to fix — sub-dir hasn't been created yet
-
-    if sub_cfg.exists():
-        return  # already present — nothing to do
-
+    if not sub_dir.is_dir() or sub_cfg.exists():
+        return
     if root_cfg.exists():
-        log.info(
-            "Copying preprocessor_config.json → speech_tokenizer/ "
-            "(work-around for qwen_tts AutoFeatureExtractor path bug)"
-        )
-        _shutil.copy2(str(root_cfg), str(sub_cfg))
+        log.info("Copying preprocessor_config.json → speech_tokenizer/ (cache fix)")
+        shutil.copy2(str(root_cfg), str(sub_cfg))
     else:
-        log.warning(
-            "preprocessor_config.json not found at snapshot root (%s). "
-            "Model loading may fail.",
-            snapshot_dir,
-        )
+        log.warning("preprocessor_config.json not found at snapshot root (%s)", snapshot_dir)
 
 
 def load_model_and_components(base_model: str, bf16: bool):
     """
-    Load Qwen3TTSModel via qwen_tts.
-    Returns (talker, text_tokenizer, speech_tokenizer, full_wrapper).
-
-    Model path (as confirmed from faster_qwen3_tts/model.py):
-      wrapper                       = Qwen3TTSModel (inference wrapper)
-      wrapper.model                 = Qwen3TTSForConditionalGeneration
-      wrapper.model.talker          = Qwen3TTSTalkerForConditionalGeneration  ← fine-tune this
-      wrapper.model.speech_tokenizer= Qwen3TTSTokenizer (VQ codec)
-      wrapper.processor             = Qwen3TTSProcessor (has .tokenizer for text)
+    Load Qwen3TTSModel and return (talker, text_tokenizer, speech_tokenizer, wrapper).
     """
     try:
         from qwen_tts import Qwen3TTSModel
     except ImportError as exc:
-        raise SystemExit("qwen-tts is required. Install with: uv pip install qwen-tts") from exc
+        raise SystemExit("qwen-tts is required. Install: uv pip install qwen-tts") from exc
 
     log.info("Loading Qwen3TTSModel from %s …", base_model)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if bf16 else torch.float32
+    dtype  = torch.bfloat16 if bf16 else torch.float32
+    hf_token = os.environ.get("HF_TOKEN") or None
 
-    # Pass token explicitly so the model loads even when HF_HOME is
-    # overridden (token may be in HF_TOKEN env var rather than the cache).
-    import os as _os
-    _hf_token = _os.environ.get("HF_TOKEN") or None
-
-    # ── Pre-download snapshot and apply cache fix ──────────────────────────
-    # huggingface_hub.snapshot_download() will re-use whatever is already in
-    # the cache (fast path), then we patch speech_tokenizer/ if needed.
-    # We only do this for Hub model IDs (not local paths).
+    # Resolve to local snapshot (applies cache fix, re-uses cached weights)
+    load_path = base_model
     if not Path(base_model).exists():
         try:
-            from huggingface_hub import snapshot_download as _snapshot_dl
-            log.info("Pre-downloading / validating snapshot for %s …", base_model)
-            snapshot_dir = _snapshot_dl(
-                base_model,
-                token=_hf_token,
+            from huggingface_hub import snapshot_download
+            load_path = snapshot_download(
+                base_model, token=hf_token,
                 ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
             )
-            _ensure_speech_tokenizer_preprocessor(snapshot_dir)
-            # Load from local snapshot directory to avoid re-resolving the path
-            load_path: str = snapshot_dir
-        except Exception as _e:
-            log.warning("snapshot_download failed (%s); attempting direct load …", _e)
+            _ensure_speech_tokenizer_preprocessor(load_path)
+        except Exception as e:
+            log.warning("snapshot_download failed (%s); loading directly", e)
             load_path = base_model
     else:
-        # base_model is already a local directory path
         _ensure_speech_tokenizer_preprocessor(base_model)
-        load_path = base_model
 
     wrapper = Qwen3TTSModel.from_pretrained(
-        load_path,
-        torch_dtype=dtype,
-        device_map=device,
-        token=_hf_token,
+        load_path, dtype=dtype, device_map=device, token=hf_token,
     )
 
-    full_model = wrapper.model  # Qwen3TTSForConditionalGeneration
-    talker = full_model.talker  # Qwen3TTSTalkerForConditionalGeneration
+    full_model    = wrapper.model
+    talker        = full_model.talker
+    speech_tok    = full_model.speech_tokenizer
 
-    speech_tokenizer = full_model.speech_tokenizer
-    if speech_tokenizer is None:
-        raise RuntimeError("speech_tokenizer was not loaded by from_pretrained. "
-                           "Make sure you are loading from an official Qwen3-TTS checkpoint.")
-
-    # Processor has an inner text tokenizer
-    processor = wrapper.processor
-    text_tokenizer = getattr(processor, "tokenizer", None) or getattr(processor, "text_tokenizer", None)
-    if text_tokenizer is None:
-        # Fallback: use AutoTokenizer with the same path
+    processor     = wrapper.processor
+    text_tok = (
+        getattr(processor, "tokenizer", None)
+        or getattr(processor, "text_tokenizer", None)
+    )
+    if text_tok is None:
         from transformers import AutoTokenizer
-        text_tokenizer = AutoTokenizer.from_pretrained(load_path)
+        text_tok = AutoTokenizer.from_pretrained(load_path)
 
-    log.info("Talker type: %s", type(talker).__name__)
-    log.info("Speech tokenizer type: %s", type(speech_tokenizer).__name__)
-    log.info("Text tokenizer type: %s", type(text_tokenizer).__name__)
+    log.info("Talker:            %s", type(talker).__name__)
+    log.info("Speech tokenizer:  %s", type(speech_tok).__name__)
+    log.info("Text tokenizer:    %s", type(text_tok).__name__)
 
-    return talker, text_tokenizer, speech_tokenizer, wrapper
+    return talker, text_tok, speech_tok, wrapper
 
 
 def apply_lora(talker, lora_cfg: dict):
     try:
         from peft import LoraConfig, TaskType, get_peft_model
     except ImportError as exc:
-        raise SystemExit("peft is required for LoRA. Install with: uv pip install peft") from exc
+        raise SystemExit("peft is required: uv pip install peft") from exc
 
     config = LoraConfig(
-        r=lora_cfg.get("r", 64),
-        lora_alpha=lora_cfg.get("lora_alpha", 128),
-        lora_dropout=lora_cfg.get("lora_dropout", 0.05),
-        target_modules=lora_cfg.get(
+        r               = lora_cfg.get("r", 64),
+        lora_alpha      = lora_cfg.get("lora_alpha", 128),
+        lora_dropout    = lora_cfg.get("lora_dropout", 0.05),
+        target_modules  = lora_cfg.get(
             "target_modules",
             ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         ),
-        task_type=TaskType.CAUSAL_LM,
-        bias="none",
+        task_type       = TaskType.CAUSAL_LM,
+        bias            = "none",
     )
     talker = get_peft_model(talker, config)
     talker.print_trainable_parameters()
@@ -463,45 +459,41 @@ def apply_lora(talker, lora_cfg: dict):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", type=Path, default=None, help="Path to JSON config written by train_qwen3tts.py")
-    p.add_argument("--train-jsonl", type=Path)
-    p.add_argument("--val-jsonl", type=Path)
-    p.add_argument("--base-model", type=str, default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-    p.add_argument("--output-dir", type=Path, default=Path("outputs/qwen3tts-sada22-lora"))
-    p.add_argument("--mode", choices=["full", "lora"], default="lora")
-    p.add_argument("--max-steps", type=int, default=50)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--grad-accum", type=int, default=4)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--bf16", action="store_true", default=False)
-    p.add_argument("--logging-steps", type=int, default=5)
+    p.add_argument("--config",       type=Path, default=None)
+    p.add_argument("--train-jsonl",  type=Path)
+    p.add_argument("--val-jsonl",    type=Path)
+    p.add_argument("--base-model",   type=str, default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+    p.add_argument("--output-dir",   type=Path, default=Path("outputs/qwen3tts-sada22-lora"))
+    p.add_argument("--mode",         choices=["full", "lora"], default="lora")
+    p.add_argument("--max-steps",    type=int,   default=50)
+    p.add_argument("--epochs",       type=int,   default=1)
+    p.add_argument("--batch-size",   type=int,   default=1)
+    p.add_argument("--grad-accum",   type=int,   default=4)
+    p.add_argument("--lr",           type=float, default=2e-5)
+    p.add_argument("--bf16",         action="store_true", default=False)
+    p.add_argument("--logging-steps",type=int,   default=5)
     return p.parse_args()
 
 
 def merge_config_into_args(args: argparse.Namespace) -> argparse.Namespace:
-    """If --config is given, override defaults with values from that JSON."""
     if args.config is None:
         return args
     cfg = json.loads(args.config.read_text())
-    if args.train_jsonl is None:
+    if args.train_jsonl is None and "train_file" in cfg:
         args.train_jsonl = Path(cfg["train_file"])
     if args.val_jsonl is None:
         args.val_jsonl = Path(cfg.get("validation_file", cfg.get("val_file", "")))
-    args.base_model = cfg.get("base_model", args.base_model)
-    args.output_dir = Path(cfg.get("output_dir", str(args.output_dir)))
-    args.lr = float(cfg.get("learning_rate", args.lr))
-    args.batch_size = int(cfg.get("per_device_train_batch_size", args.batch_size))
-    args.grad_accum = int(cfg.get("gradient_accumulation_steps", args.grad_accum))
-    args.bf16 = cfg.get("bf16", args.bf16)
-    if "max_steps" in cfg and int(cfg["max_steps"]) > 0 and args.max_steps == 50:
+    args.base_model  = cfg.get("base_model",                   args.base_model)
+    args.output_dir  = Path(cfg.get("output_dir",              str(args.output_dir)))
+    args.lr          = float(cfg.get("learning_rate",          args.lr))
+    args.batch_size  = int(cfg.get("per_device_train_batch_size", args.batch_size))
+    args.grad_accum  = int(cfg.get("gradient_accumulation_steps", args.grad_accum))
+    args.bf16        = cfg.get("bf16",                         args.bf16)
+    if "max_steps" in cfg and int(cfg["max_steps"]) > 0:
         args.max_steps = int(cfg["max_steps"])
     if "num_train_epochs" in cfg:
         args.epochs = int(cfg["num_train_epochs"])
-    if "peft" in cfg and cfg["peft"] is not None:
-        args.mode = "lora"
-    else:
-        args.mode = "full"
+    args.mode = "lora" if cfg.get("peft") else "full"
     return args
 
 
@@ -514,129 +506,107 @@ def main() -> None:
     args = merge_config_into_args(args)
 
     if args.train_jsonl is None:
-        raise SystemExit("--train-jsonl is required (or pass --config pointing to a JSON config file)")
+        raise SystemExit("--train-jsonl is required")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Device / dtype selection (works on CPU and CUDA)
-    # ------------------------------------------------------------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # bf16 only on Ampere+ CUDA; FP32 on CPU or older GPUs
-    bf16 = args.bf16 and device == "cuda" and torch.cuda.is_bf16_supported()
-    use_fp16 = (device == "cuda") and not bf16   # fp16 as fallback on older CUDA
-    log.info("Device: %s  | bf16: %s  | fp16: %s", device, bf16, use_fp16)
+    bf16   = args.bf16 and device == "cuda" and torch.cuda.is_bf16_supported()
+    fp16   = (device == "cuda") and not bf16
+    log.info("Device: %s  | bf16: %s  | fp16: %s", device, bf16, fp16)
 
-    # ------------------------------------------------------------------
-    # Load model (device/dtype handled inside)
-    # ------------------------------------------------------------------
-    talker, text_tokenizer, speech_tokenizer, wrapper = load_model_and_components(args.base_model, bf16)
+    # Load model components
+    talker, text_tok, speech_tok, wrapper = load_model_and_components(args.base_model, bf16)
 
     if args.mode == "lora":
-        lora_cfg = {
-            "r": 64,
-            "lora_alpha": 128,
-            "lora_dropout": 0.05,
-            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        }
-        talker = apply_lora(talker, lora_cfg)
+        talker = apply_lora(talker, {
+            "r": 64, "lora_alpha": 128, "lora_dropout": 0.05,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
+                               "gate_proj", "up_proj", "down_proj"],
+        })
 
-    # Move speech_tokenizer to device; talker is already on device via device_map
-    try:
-        speech_tokenizer.to(device)
-    except Exception:
-        pass  # some speech tokenizer impls are not nn.Module
     if next(talker.parameters(), None) is not None:
         talker.to(device)
-    log.info("Training on device: %s  |  bf16: %s  |  fp16: %s", device, bf16, use_fp16)
+    log.info("Training on device: %s  |  bf16: %s  |  fp16: %s", device, bf16, fp16)
 
-    # ------------------------------------------------------------------
-    # Datasets & collator
-    # ------------------------------------------------------------------
+    # Datasets
     train_ds = Sada22SFTDataset(args.train_jsonl)
-    val_ds = Sada22SFTDataset(args.val_jsonl) if args.val_jsonl and args.val_jsonl.exists() else None
+    val_ds   = Sada22SFTDataset(args.val_jsonl) if (
+        args.val_jsonl and args.val_jsonl.exists()
+    ) else None
 
-    collator = TalkerCollator(text_tokenizer, speech_tokenizer, device=device)
+    collator = TalkerCollator(text_tok, speech_tok)
 
-    # ------------------------------------------------------------------
-    # Trainer setup
-    # ------------------------------------------------------------------
-    from transformers import TrainingArguments, Trainer
+    # Training args
+    from transformers import TrainingArguments
 
-    # Compute steps
-    effective_max_steps = args.max_steps if args.max_steps > 0 else -1
+    eff_steps  = args.max_steps if args.max_steps > 0 else -1
     save_steps = max(10, (args.max_steps // 2) if args.max_steps > 0 else 500)
-    eval_steps = save_steps
-    logging_steps = max(1, min(args.logging_steps, save_steps // 2))
+    log_steps  = max(1, min(args.logging_steps, save_steps // 2))
 
     training_args = TrainingArguments(
-        output_dir=str(args.output_dir),
-        num_train_epochs=args.epochs if effective_max_steps < 0 else 100,  # large; capped by max_steps
-        max_steps=effective_max_steps,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.lr,
-        bf16=bf16,
-        fp16=use_fp16,  # fp16 fallback on CUDA without bf16 support; always False on CPU
-        no_cuda=(device == "cpu"),  # ensure HF Trainer doesn't try to use GPU when on CPU
-        logging_dir=str(args.output_dir / "logs"),
-        logging_steps=logging_steps,
-        save_strategy="steps",
-        save_steps=save_steps,
-        eval_strategy="steps" if val_ds else "no",
-        eval_steps=eval_steps if val_ds else None,
-        report_to="none",       # no W&B / wandb needed
-        load_best_model_at_end=False,
-        dataloader_num_workers=0,            # avoid mp issues in first run
-        remove_unused_columns=False,
-        label_names=["labels"],
+        output_dir                  = str(args.output_dir),
+        num_train_epochs            = args.epochs if eff_steps < 0 else 9999,
+        max_steps                   = eff_steps,
+        per_device_train_batch_size = args.batch_size,
+        gradient_accumulation_steps = args.grad_accum,
+        learning_rate               = args.lr,
+        bf16                        = bf16,
+        fp16                        = fp16,
+        no_cuda                     = (device == "cpu"),
+        logging_dir                 = str(args.output_dir / "logs"),
+        logging_steps               = log_steps,
+        save_strategy               = "steps",
+        save_steps                  = save_steps,
+        eval_strategy               = "steps" if val_ds else "no",
+        eval_steps                  = save_steps if val_ds else None,
+        report_to                   = "none",
+        load_best_model_at_end      = False,
+        dataloader_num_workers      = 0,
+        remove_unused_columns       = False,
+        label_names                 = ["codec_0_labels"],
     )
 
-    trainer = Trainer(
-        model=talker,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=collator,
-        processing_class=text_tokenizer,
+    TrainerClass = _make_trainer_class()
+    trainer = TrainerClass(
+        model          = talker,
+        args           = training_args,
+        train_dataset  = train_ds,
+        eval_dataset   = val_ds,
+        data_collator  = collator,
+        processing_class = text_tok,
     )
 
     log.info("Starting training: max_steps=%s, batch=%s, grad_accum=%s",
-             effective_max_steps, args.batch_size, args.grad_accum)
-
+             eff_steps, args.batch_size, args.grad_accum)
     train_result = trainer.train()
 
-    # ------------------------------------------------------------------
-    # Save adapter (LoRA) or full weights
-    # ------------------------------------------------------------------
-    log.info("Saving model to %s …", args.output_dir)
+    # Save
+    log.info("Saving checkpoint to %s …", args.output_dir)
     trainer.save_model(str(args.output_dir))
     try:
-        text_tokenizer.save_pretrained(str(args.output_dir))
+        text_tok.save_pretrained(str(args.output_dir))
     except Exception as e:
         log.warning("Could not save text_tokenizer: %s", e)
 
-    # Save training metrics for validation script
     metrics = train_result.metrics
     metrics["train_samples"] = len(train_ds)
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
 
-    # Dump loss history for the validate script
     loss_history = [
-        {"step": entry["step"], "loss": entry.get("loss", entry.get("train_loss"))}
-        for entry in trainer.state.log_history
-        if "loss" in entry or "train_loss" in entry
+        {"step": e["step"], "loss": e.get("loss", e.get("train_loss"))}
+        for e in trainer.state.log_history
+        if "loss" in e or "train_loss" in e
     ]
     (args.output_dir / "loss_history.json").write_text(
         json.dumps(loss_history, indent=2), encoding="utf-8"
     )
     log.info("Loss history: %s", loss_history)
-
     print(f"\nFINE_TUNE_OK  output_dir={args.output_dir}  steps={trainer.state.global_step}")
-    print(f"Final loss: {metrics.get('train_loss', 'n/a'):.4f}" if isinstance(metrics.get('train_loss'), float) else "")
 
 
 if __name__ == "__main__":
     main()
+
