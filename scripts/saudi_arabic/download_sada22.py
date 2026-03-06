@@ -150,30 +150,53 @@ def load_kaggle_input(
         "SpeakerDialect", "Speaker",
     ]
 
+    # Full 16-column layout (with leading blank index):
+    # <idx>, FileName, ShowName, FullFileLength, SegmentID, SegmentLength,
+    # SegmentStart, SegmentEnd, SpeakerAge, SpeakerGender, SpeakerDialect,
+    # Speaker, Environment, GroundTruthText, ProcessedText, Category
+    COLS_16 = [
+        "_idx", "FileName", "ShowName", "FullFileLength", "SegmentID",
+        "SegmentLength", "SegmentStart", "SegmentEnd", "SpeakerAge",
+        "SpeakerGender", "SpeakerDialect", "Speaker", "Environment",
+        "GroundTruthText", "ProcessedText", "Category",
+    ]
+
     csv_path = kaggle_input_dir / "train.csv"
     if not csv_path.exists():
         raise SystemExit(f"train.csv not found at {csv_path}")
 
-    # Auto-detect header: peek at the first cell
+    # Auto-detect header robustly:
+    # Read the raw first line. If the second token looks like a column name
+    # (contains only ASCII letters/digits/underscore) rather than a number or
+    # file path, the file has a header row.
     with open(csv_path, encoding="utf-8") as fh:
-        first_cell = fh.readline().split(",")[0].strip().lower()
-    has_header = first_cell in ("audio_path", "audio", "filepath", "path", "processedtext")
+        first_line = fh.readline()
+    first_row_tokens = [t.strip() for t in first_line.split(",")]
+    # token[1] is "FileName" when header present, or a wav path when headerless
+    token1 = first_row_tokens[1] if len(first_row_tokens) > 1 else ""
+    has_header = token1.replace("_", "").isalpha()  # letters-only → column name
 
     if has_header:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, low_memory=False)
+        # Drop unnamed leading index column if present
+        unnamed = [c for c in df.columns if str(c).startswith("Unnamed")]
+        if unnamed:
+            df = df.drop(columns=unnamed)
     else:
-        df = pd.read_csv(csv_path, header=None)
+        df = pd.read_csv(csv_path, header=None, low_memory=False)
         ncols = df.shape[1]
-        if ncols == len(COLS_NO_HEADER):
+        if ncols == len(COLS_16):
+            df.columns = COLS_16
+            df = df.drop(columns=["_idx"])
+        elif ncols == len(COLS_NO_HEADER):
             df.columns = COLS_NO_HEADER
         elif ncols == len(COLS_NO_HEADER) + 1:
-            # Leading row-index column emitted by some exporters
             df.columns = ["_idx"] + COLS_NO_HEADER
             df = df.drop(columns=["_idx"])
         else:
             raise SystemExit(
-                f"train.csv has {ncols} columns — expected {len(COLS_NO_HEADER)} or "
-                f"{len(COLS_NO_HEADER) + 1} (with leading index).\n"
+                f"train.csv has {ncols} columns — expected {len(COLS_NO_HEADER)}, "
+                f"{len(COLS_NO_HEADER) + 1}, or {len(COLS_16)}.\n"
                 f"First row: {list(df.iloc[0])}"
             )
 
@@ -186,10 +209,12 @@ def load_kaggle_input(
                 return col_map[name.lower()]
         return None
 
-    audio_col = find_col("audio_path", "audio", "filepath", "path")
-    text_col  = find_col("processedtext", "text", "transcript")
-    spk_col   = find_col("speaker", "speaker_id")
-    dia_col   = find_col("speakerdialect", "dialect")
+    audio_col  = find_col("filename", "audio_path", "audio", "filepath", "path")
+    text_col   = find_col("processedtext", "groundtruthtext", "text", "transcript")
+    spk_col    = find_col("speaker", "speaker_id")
+    dia_col    = find_col("speakerdialect", "dialect")
+    start_col  = find_col("segmentstart", "starttime", "start")
+    end_col    = find_col("segmentend",   "endtime",   "end")
 
     if not audio_col:
         raise SystemExit(f"Cannot find audio column. Columns present: {list(df.columns)}")
@@ -212,7 +237,10 @@ def load_kaggle_input(
 
     # ── Build rows — audio stored as path dict ────────────────────────────────
     # preprocess_sada22.py already handles {"path": ..., "bytes": None} format.
-    extra_cols = [c for c in df.columns if c not in [audio_col, text_col, spk_col, dia_col]]
+    extra_cols = [
+        c for c in df.columns
+        if c not in filter(None, [audio_col, text_col, spk_col, dia_col, start_col, end_col])
+    ]
     rows: list[dict] = []
     missing = 0
     for _, row in tqdm(df.iterrows(), total=len(df), desc="  Indexing rows"):
@@ -226,6 +254,13 @@ def load_kaggle_input(
             "Speaker":        str(row[spk_col])  if spk_col  else "",
             "SpeakerDialect": str(row[dia_col])  if dia_col  else "",
         }
+        # Store segment timestamps so preprocess_sada22.py can trim the audio.
+        # The full file is a show recording; only [SegmentStart, SegmentEnd]
+        # seconds contain the speaker voice — the rest may be music/other.
+        if start_col and not pd.isna(row.get(start_col)):
+            entry["segment_start_sec"] = float(row[start_col])
+        if end_col and not pd.isna(row.get(end_col)):
+            entry["segment_end_sec"] = float(row[end_col])
         for c in extra_cols:
             entry[c] = str(row.get(c, ""))
         rows.append(entry)

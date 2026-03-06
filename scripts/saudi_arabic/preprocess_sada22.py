@@ -50,21 +50,34 @@ def extract_audio_text(example: dict[str, Any], audio_key: str, text_key: str) -
     text = str(example[text_key])
 
     if isinstance(audio_obj, dict) and "array" in audio_obj and "sampling_rate" in audio_obj:
-        return np.asarray(audio_obj["array"], dtype=np.float32), int(audio_obj["sampling_rate"]), text
-
-    if isinstance(audio_obj, dict) and "bytes" in audio_obj and audio_obj["bytes"]:
+        wav, sr = np.asarray(audio_obj["array"], dtype=np.float32), int(audio_obj["sampling_rate"])
+    elif isinstance(audio_obj, dict) and "bytes" in audio_obj and audio_obj["bytes"]:
         wav, sr = sf.read(io.BytesIO(audio_obj["bytes"]))
-        return np.asarray(wav, dtype=np.float32), int(sr), text
-
-    if isinstance(audio_obj, dict) and "path" in audio_obj and audio_obj["path"] and Path(audio_obj["path"]).exists():
+        wav = np.asarray(wav, dtype=np.float32)
+    elif isinstance(audio_obj, dict) and "path" in audio_obj and audio_obj["path"] and Path(audio_obj["path"]).exists():
         wav, sr = sf.read(audio_obj["path"])
-        return np.asarray(wav, dtype=np.float32), int(sr), text
-
-    if isinstance(audio_obj, str):
+        wav = np.asarray(wav, dtype=np.float32)
+    elif isinstance(audio_obj, str):
         wav, sr = sf.read(audio_obj)
-        return np.asarray(wav, dtype=np.float32), int(sr), text
+        wav = np.asarray(wav, dtype=np.float32)
+    else:
+        raise ValueError(f"Unsupported audio field format: {type(audio_obj)}")
 
-    raise ValueError(f"Unsupported audio field format: {type(audio_obj)}")
+    # Trim to segment boundaries if provided (SADA22 files are full show
+    # recordings; only [segment_start_sec, segment_end_sec] has speaker audio).
+    start_sec = example.get("segment_start_sec")
+    end_sec   = example.get("segment_end_sec")
+    if start_sec is not None or end_sec is not None:
+        start_sample = int(float(start_sec) * sr) if start_sec is not None else 0
+        end_sample   = int(float(end_sec)   * sr) if end_sec   is not None else len(wav)
+        start_sample = max(0, start_sample)
+        end_sample   = min(len(wav), end_sample)
+        if wav.ndim == 2:
+            wav = wav[start_sample:end_sample]
+        else:
+            wav = wav[start_sample:end_sample]
+
+    return wav, int(sr), text
 
 
 def parse_args() -> argparse.Namespace:
