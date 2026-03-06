@@ -168,11 +168,14 @@ class TalkerCollator:
         self,
         text_ids: list[int],
         audio_codes: list[list[int]],   # List[T × 16 ints]
-    ) -> tuple[list, list, list, list]:
+    ) -> tuple[list, list, list, list, list, list, list]:
         """
-        Returns (text_channel, codec_channel, codec_ids_flat, labels) each length T_seq.
-          codec_ids_flat: List[16 ints] per position (zeros outside codec region)
-          labels:  -100 outside codec region, codec col-0 value at codec positions
+        Returns (text_channel, codec_channel, codec_ids_flat, labels,
+                 text_emb_mask, codec_emb_mask, codec_mask) each length T_seq.
+
+        text_emb_mask : bool  — True at every valid (non-padding) position
+        codec_emb_mask: bool  — True from pos 3 onward, False at pos 6 (speaker slot)
+        codec_mask    : bool  — True only at the T audio-frame positions (not EOS)
         """
         L = len(text_ids)
         T = len(audio_codes)
@@ -191,170 +194,221 @@ class TalkerCollator:
         _PAD_16   = [cp] + [0] * (NUM_CODEBOOKS - 1)  # pad only codebook-0
 
         # Build channels position by position (matches official dataset.py layout)
-        text_ch:  list[int]       = []
-        codec_ch: list[int]       = []
-        cids:     list[list[int]] = []
-        labels:   list[int]       = []
+        text_ch:       list[int]       = []
+        codec_ch:      list[int]       = []
+        cids:          list[list[int]] = []
+        labels:        list[int]       = []
+        text_emb_mask: list[bool]      = []   # True for every valid position
+        codec_emb_mask:list[bool]      = []   # True from pos 3, False at pos 6
+        codec_mask:    list[bool]      = []   # True only at T audio-frame positions
+
+        def _pos(tc, cc, ci, lab, te, ce_, cm):
+            text_ch.append(tc);  codec_ch.append(cc);  cids.append(ci);  labels.append(lab)
+            text_emb_mask.append(te);  codec_emb_mask.append(ce_);  codec_mask.append(cm)
 
         # Pos 0-2: first 3 text tokens, codec channel = 0
         for tok_id in text_ids[:3]:
-            text_ch.append(tok_id);  codec_ch.append(0);  cids.append(_ZEROS_16);  labels.append(-100)
+            _pos(tok_id, 0, _ZEROS_16, -100, True, False, False)
 
         # Pos 3-5: think tokens in codec channel
         for c in (cn, ctb, cte):
-            text_ch.append(p);  codec_ch.append(c);  cids.append(_ZEROS_16);  labels.append(-100)
+            _pos(p, c, _ZEROS_16, -100, True, True, False)
 
-        # Pos 6: speaker slot (zeroed — no speaker encoder)
-        text_ch.append(p);  codec_ch.append(0);  cids.append(_ZEROS_16);  labels.append(-100)
+        # Pos 6: speaker slot — codec_emb_mask=False (speaker injected externally; we use zeros)
+        _pos(p, 0, _ZEROS_16, -100, True, False, False)
 
         # Pos 7: tts_bos | codec_pad
-        text_ch.append(bos);  codec_ch.append(cp);  cids.append(_ZEROS_16);  labels.append(-100)
+        _pos(bos, cp, _ZEROS_16, -100, True, True, False)
 
         # Pos 8 .. 8+(L-3)-1 = 8+L-4: text_ids[3:] | codec_pad
         for tok_id in text_ids[3:]:
-            text_ch.append(tok_id);  codec_ch.append(cp);  cids.append(_ZEROS_16);  labels.append(-100)
+            _pos(tok_id, cp, _ZEROS_16, -100, True, True, False)
 
         # Pos 8+L-3: tts_eos | codec_pad
-        text_ch.append(eos);  codec_ch.append(cp);  cids.append(_ZEROS_16);  labels.append(-100)
+        _pos(eos, cp, _ZEROS_16, -100, True, True, False)
 
-        # Pos 8+L-2: tts_pad | codec_bos (codec sequence starts)
-        text_ch.append(p);  codec_ch.append(cb);  cids.append(_ZEROS_16);  labels.append(-100)
+        # Pos 8+L-2: tts_pad | codec_bos
+        _pos(p, cb, _ZEROS_16, -100, True, True, False)
 
-        # Pos 8+L-1 .. 8+L-1+T-1: tts_pad | codec col-0; codec_ids = full 16-book row
+        # Pos 8+L-1 .. 8+L-1+T-1: T audio frames  (codec_mask=True)
         for frame in audio_codes:
-            text_ch.append(p)
-            codec_ch.append(frame[0])             # codebook-0 in codec channel
-            cids.append(list(frame))              # all 16 codebooks
-            labels.append(frame[0])              # CE loss on codebook-0
+            _pos(p, frame[0], list(frame), frame[0], True, True, True)
 
-        # Pos 8+L-1+T: tts_pad | codec_eos  (predict EOS as final label)
-        text_ch.append(p);  codec_ch.append(ce);  cids.append(_ZEROS_16);  labels.append(ce)
+        # Pos 8+L-1+T: codec_eos  (codec_mask=False — EOS position not included in sub-talker)
+        _pos(p, ce, _ZEROS_16, ce, True, True, False)
 
-        return text_ch, codec_ch, cids, labels
+        return text_ch, codec_ch, cids, labels, text_emb_mask, codec_emb_mask, codec_mask
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        all_text_ch:  list[torch.Tensor] = []
-        all_codec_ch: list[torch.Tensor] = []
-        all_cids:     list[torch.Tensor] = []    # (T_seq, 16) per sample
-        all_labels:   list[torch.Tensor] = []
+        all_text_ch:        list[torch.Tensor] = []
+        all_codec_ch:       list[torch.Tensor] = []
+        all_cids:           list[torch.Tensor] = []   # (T_seq, 16) per sample
+        all_labels:         list[torch.Tensor] = []
+        all_text_emb_mask:  list[torch.Tensor] = []
+        all_codec_emb_mask: list[torch.Tensor] = []
+        all_codec_mask:     list[torch.Tensor] = []
 
         for item in batch:
             text_ids    = self._build_text_ids(item["text"])
             audio_codes = item["audio_codes"]
 
-            tc, cc, cids, labs = self._build_sample(text_ids, audio_codes)
+            tc, cc, cids, labs, tem, cem, cm = self._build_sample(text_ids, audio_codes)
 
             all_text_ch.append(torch.tensor(tc,   dtype=torch.long))
             all_codec_ch.append(torch.tensor(cc,  dtype=torch.long))
-            all_cids.append(torch.tensor(cids,    dtype=torch.long))  # (T_seq, 16)
+            all_cids.append(torch.tensor(cids,    dtype=torch.long))   # (T_seq, 16)
             all_labels.append(torch.tensor(labs,  dtype=torch.long))
+            all_text_emb_mask.append(torch.tensor(tem,  dtype=torch.bool))
+            all_codec_emb_mask.append(torch.tensor(cem, dtype=torch.bool))
+            all_codec_mask.append(torch.tensor(cm,      dtype=torch.bool))
 
-        # Pad everything to the longest sequence in the batch
+        # Pad to the longest sequence in the batch
         max_len = max(t.size(0) for t in all_text_ch)
-        pad_tok  = self.tts_pad_id
-        pad_cid  = self.codec_pad_id
+        pad_tok = self.tts_pad_id
+        pad_cid = self.codec_pad_id
 
-        def _pad(t: torch.Tensor, pad_val: int, target_len: int) -> torch.Tensor:
-            diff = target_len - t.size(0)
-            if diff == 0:
-                return t
-            padding = torch.full((diff,), pad_val, dtype=torch.long)
-            return torch.cat([t, padding], dim=0)
+        def _pad_long(t: torch.Tensor, val: int, tl: int) -> torch.Tensor:
+            d = tl - t.size(0)
+            return t if d == 0 else torch.cat([t, torch.full((d,), val, dtype=torch.long)])
 
-        def _pad_cids(t: torch.Tensor, target_len: int) -> torch.Tensor:
-            diff = target_len - t.size(0)
-            if diff == 0:
-                return t
-            padding = torch.zeros(diff, NUM_CODEBOOKS, dtype=torch.long)
-            return torch.cat([t, padding], dim=0)
+        def _pad_bool(t: torch.Tensor, tl: int) -> torch.Tensor:
+            d = tl - t.size(0)
+            return t if d == 0 else torch.cat([t, torch.zeros(d, dtype=torch.bool)])
 
-        text_ch_padded  = torch.stack([_pad(t, pad_tok,  max_len) for t in all_text_ch])   # (B, T)
-        codec_ch_padded = torch.stack([_pad(t, pad_cid,  max_len) for t in all_codec_ch])  # (B, T)
-        cids_padded     = torch.stack([_pad_cids(t,      max_len) for t in all_cids])       # (B, T, 16)
-        labels_padded   = torch.stack([_pad(t, -100,     max_len) for t in all_labels])     # (B, T)
+        def _pad_cids(t: torch.Tensor, tl: int) -> torch.Tensor:
+            d = tl - t.size(0)
+            return t if d == 0 else torch.cat([t, torch.zeros(d, NUM_CODEBOOKS, dtype=torch.long)])
 
-        # Dual-channel input: (B, T, 2)
-        input_ids = torch.stack([text_ch_padded, codec_ch_padded], dim=-1)  # (B, T, 2)
+        text_ch_p  = torch.stack([_pad_long(t, pad_tok, max_len) for t in all_text_ch])    # (B,T)
+        codec_ch_p = torch.stack([_pad_long(t, pad_cid, max_len) for t in all_codec_ch])   # (B,T)
+        cids_p     = torch.stack([_pad_cids(t,          max_len) for t in all_cids])        # (B,T,16)
+        labels_p   = torch.stack([_pad_long(t, -100,    max_len) for t in all_labels])      # (B,T)
+        tem_p      = torch.stack([_pad_bool(t,          max_len) for t in all_text_emb_mask])   # (B,T)
+        cem_p      = torch.stack([_pad_bool(t,          max_len) for t in all_codec_emb_mask])  # (B,T)
+        cm_p       = torch.stack([_pad_bool(t,          max_len) for t in all_codec_mask])      # (B,T)
 
-        attention_mask = (text_ch_padded != pad_tok).long()
+        # Dual-channel token IDs: (B, T, 2)  — channel 0=text, channel 1=codec
+        input_ids = torch.stack([text_ch_p, codec_ch_p], dim=-1)   # (B, T, 2)
+
+        # attention_mask follows text channel (padding=tts_pad at pad positions)
+        attention_mask = tem_p.long()   # (B, T)
 
         return {
-            "input_ids":      input_ids,       # (B, T, 2)
-            "attention_mask": attention_mask,   # (B, T)
-            "codec_ids":      cids_padded,      # (B, T, 16)
-            "codec_0_labels": labels_padded,    # (B, T)
+            "input_ids":           input_ids,           # (B, T, 2)
+            "attention_mask":      attention_mask,       # (B, T)
+            "codec_ids":           cids_p,              # (B, T, 16)
+            "codec_0_labels":      labels_p,            # (B, T)
+            "text_embedding_mask": tem_p.unsqueeze(-1), # (B, T, 1) bool
+            "codec_embedding_mask":cem_p.unsqueeze(-1), # (B, T, 1) bool
+            "codec_mask":          cm_p,                # (B, T) bool
         }
 
 
 # ---------------------------------------------------------------------------
-# Custom Trainer — passes dual-channel inputs, computes official loss
+# Custom Trainer — builds inputs_embeds and computes official loss
 # ---------------------------------------------------------------------------
 
-class Qwen3TTSTrainer:
+def _make_trainer_class(text_embedding, codec_embedding, code_predictor):
     """
-    Thin wrapper around the HF Trainer that overrides compute_loss to use
-    the Qwen3-TTS dual-channel training forward.
+    Create a HF Trainer subclass closed over the three sub-modules needed to
+    build inputs_embeds, following the official finetuning/sft_12hz.py recipe:
 
-    Forward call (mirrors official finetuning/train.py):
+      input_text_embedding  = text_embedding(text_ids)  * text_embedding_mask  # (B,T,H)
+      input_codec_embedding = codec_embedding(codec_ids) * codec_embedding_mask # (B,T,H)
+      input_embeddings = input_text_embedding + input_codec_embedding
+      # add codebooks 1-15 at codec positions
+      for i in 1..15:
+          input_embeddings += sub_emb[i-1](codec_ids[:,:,i]) * codec_mask
+
       outputs = talker(
-          input_ids      = input_ids[:, :-1, :],      # (B, T-1, 2), shift for CLM
+          inputs_embeds  = input_embeddings[:, :-1, :],  # prefill path (shape[1]>1)
           attention_mask = attention_mask[:, :-1],
-          labels         = codec_0_labels[:, 1:],      # (B, T-1), shift left
+          labels         = codec_0_labels[:, 1:],
           output_hidden_states = True,
       )
-      loss = outputs.loss + SUB_TALKER_LOSS_WEIGHT * sub_talker_loss
-
-    Sub-talker loss: codebooks 1-15 predicted from main talker hidden states.
+      loss = outputs.loss + 0.3 * sub_talker_loss
     """
-
-    @staticmethod
-    def compute_loss_fn(model, inputs, return_outputs=False, num_items_in_batch=None):
-        input_ids      = inputs["input_ids"]       # (B, T, 2)
-        attention_mask = inputs["attention_mask"]  # (B, T)
-        codec_ids      = inputs["codec_ids"]       # (B, T, 16)
-        codec_0_labels = inputs["codec_0_labels"]  # (B, T)
-
-        # Standard CLM shift: predict token t from tokens 0..t-1
-        outputs = model(
-            input_ids      = input_ids[:, :-1, :],
-            attention_mask = attention_mask[:, :-1],
-            labels         = codec_0_labels[:, 1:],
-            output_hidden_states=True,
-        )
-        loss = outputs.loss
-
-        # Sub-talker loss (codebooks 1–15)
-        try:
-            hidden = outputs.hidden_states[-1]        # (B, T-1, H) last layer
-            codec_mask = (codec_0_labels[:, 1:] != -100)  # (B, T-1) — codec positions
-
-            talker_hidden = hidden[codec_mask]         # (N, H)
-            talker_cids   = codec_ids[:, 1:][codec_mask]  # (N, 16)
-
-            if talker_hidden.numel() > 0:
-                _, sub_loss = model.forward_sub_talker_finetune(talker_cids, talker_hidden)
-                loss = loss + SUB_TALKER_LOSS_WEIGHT * sub_loss
-        except Exception as e:
-            # sub-talker loss is optional; don't crash if unavailable
-            log.debug("Sub-talker loss skipped: %s", e)
-
-        if return_outputs:
-            return loss, outputs
-        return loss
-
-
-def _make_trainer_class():
-    """Dynamically create a Trainer subclass that uses Qwen3TTSTrainer.compute_loss_fn."""
     from transformers import Trainer
+
+    _text_emb   = text_embedding
+    _codec_emb  = codec_embedding
+    _code_pred  = code_predictor   # talker.code_predictor — for forward_sub_talker_finetune
 
     class _Trainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-            return Qwen3TTSTrainer.compute_loss_fn(
-                model, inputs, return_outputs=return_outputs,
-                num_items_in_batch=num_items_in_batch,
+            input_ids           = inputs["input_ids"]            # (B, T, 2)
+            attention_mask      = inputs["attention_mask"]       # (B, T)
+            codec_ids           = inputs["codec_ids"]            # (B, T, 16)
+            codec_0_labels      = inputs["codec_0_labels"]       # (B, T)
+            text_emb_mask       = inputs["text_embedding_mask"]  # (B, T, 1) bool
+            codec_emb_mask      = inputs["codec_embedding_mask"] # (B, T, 1) bool
+            codec_mask          = inputs["codec_mask"]           # (B, T) bool
+
+            text_ids_ch  = input_ids[:, :, 0]   # (B, T)
+            codec_ids_ch = input_ids[:, :, 1]   # (B, T)
+
+            # ── Build inputs_embeds (official sft_12hz.py recipe) ──────────
+            text_emb  = _text_emb(text_ids_ch)   * text_emb_mask.float()   # (B,T,H)
+            codec_emb = _codec_emb(codec_ids_ch) * codec_emb_mask.float()  # (B,T,H)
+            # pos 6 = speaker slot: left as zeros (no ref audio in SA fine-tune)
+            input_embeddings = text_emb + codec_emb
+
+            # Add codebook embeddings 1..15 at codec positions
+            sub_embs = _code_pred.get_input_embeddings()   # ModuleList of (15) embeddings
+            for i in range(1, NUM_CODEBOOKS):
+                ci_emb = sub_embs[i - 1](codec_ids[:, :, i])          # (B,T,H)
+                ci_emb = ci_emb * codec_mask.unsqueeze(-1).float()     # zero outside codec region
+                input_embeddings = input_embeddings + ci_emb
+
+            # ── CLM forward — prefill path (inputs_embeds.shape[1] > 1) ───
+            outputs = model(
+                inputs_embeds  = input_embeddings[:, :-1, :],
+                attention_mask = attention_mask[:, :-1],
+                labels         = codec_0_labels[:, 1:],
+                output_hidden_states = True,
             )
+            loss = outputs.loss
+
+            # ── Sub-talker loss (codebooks 1–15) ───────────────────────────
+            try:
+                # hidden_states[0] = tuple of per-layer outputs; [-1] = last layer
+                hidden = outputs.hidden_states[0][-1]      # (B, T-1, H)
+                shifted_codec_mask = codec_mask[:, 1:]     # (B, T-1) — shifted
+
+                talker_hidden = hidden[shifted_codec_mask]                      # (N, H)
+                talker_cids   = codec_ids[codec_mask].view(-1, NUM_CODEBOOKS)   # (N, 16)
+
+                if talker_hidden.numel() > 0 and talker_cids.shape[0] == talker_hidden.shape[0]:
+                    _, sub_loss = _code_pred.forward_finetune(
+                        inputs_embeds = _build_sub_talker_embeds(
+                            talker_hidden, talker_cids, model, _code_pred,
+                        ),
+                        labels = talker_cids[:, 1:],
+                    )
+                    loss = loss + SUB_TALKER_LOSS_WEIGHT * sub_loss
+            except Exception as e:
+                log.debug("Sub-talker loss skipped: %s", e)
+
+            return (loss, outputs) if return_outputs else loss
 
     return _Trainer
+
+
+def _build_sub_talker_embeds(talker_hidden, codec_ids, talker_model, code_predictor):
+    """
+    Build sub-talker inputs_embeds: [talker_hidden, emb0(codes[:,0]), emb1(codes[:,1]), ...].
+    Equivalent to talker.forward_sub_talker_finetune internals.
+    """
+    # talker_hidden: (N, H_talker), codec_ids: (N, 16)
+    embeds = [talker_hidden.unsqueeze(1)]         # (N, 1, H_talker)
+    sub_embs = code_predictor.get_input_embeddings()   # list of 15 embeddings
+    main_emb = talker_model.get_input_embeddings()     # from the PeftModel/talker
+    for i in range(NUM_CODEBOOKS - 1):
+        if i == 0:
+            embeds.append(main_emb(codec_ids[:, :1]))          # (N, 1, H_talker)
+        else:
+            embeds.append(sub_embs[i - 1](codec_ids[:, i:i+1]))  # (N, 1, H_sub)
+    return torch.cat(embeds, dim=1)                # (N, 16, H)
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +572,15 @@ def main() -> None:
     # Load model components
     talker, text_tok, speech_tok, wrapper = load_model_and_components(args.base_model, bf16)
 
+    # Extract sub-module references BEFORE LoRA wrapping so they stay valid
+    # regardless of the PEFT wrapper layer hierarchy.  Mirrors sft_12hz.py:
+    #   model.talker.model.text_embedding / .codec_embedding
+    #   model.talker.code_predictor
+    talker_inner    = talker.model          # Qwen3TTSTalkerModel
+    text_embedding  = talker_inner.text_embedding
+    codec_embedding = talker_inner.codec_embedding
+    code_predictor  = talker.code_predictor
+
     if args.mode == "lora":
         talker = apply_lora(talker, {
             "r": 64, "lora_alpha": 128, "lora_dropout": 0.05,
@@ -567,7 +630,7 @@ def main() -> None:
         label_names                 = ["codec_0_labels"],
     )
 
-    TrainerClass = _make_trainer_class()
+    TrainerClass = _make_trainer_class(text_embedding, codec_embedding, code_predictor)
     trainer = TrainerClass(
         model          = talker,
         args           = training_args,
