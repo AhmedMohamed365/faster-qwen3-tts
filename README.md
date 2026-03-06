@@ -414,7 +414,7 @@ Fine-tune Qwen3-TTS on [SADA22](https://huggingface.co/datasets/Saudi-NLP/sada22
 
 ### Prerequisites
 
-- Accept the model license: <https://huggingface.co/Qwen/Qwen3-TTS-0.6B-Base>
+- Accept the model license: <https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base>
 - Add your HuggingFace token as a Kaggle Secret named **`HF_TOKEN`**
   *(Notebook → Add-ons → Secrets → + Add secret)*
 
@@ -457,7 +457,7 @@ This single command:
 | `DIALECT` | `Najdi` | SADA22 dialect to filter |
 | `MAX_SAMPLES` | `200` | Rows to download |
 | `MAX_STEPS` | `50` | LoRA training steps |
-| `BASE_MODEL` | `Qwen/Qwen3-TTS-0.6B-Base` | HF model id |
+| `BASE_MODEL` | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | HF model id |
 
 Override any variable inline:
 
@@ -473,7 +473,7 @@ os.environ["MAX_SAMPLES"] = "500"
 | Item | Size |
 |---|---|
 | Conda env + packages | ~3 GB |
-| Qwen3-TTS-0.6B-Base weights | ~2 GB |
+| Qwen3-TTS-12Hz-0.6B-Base weights | ~2 GB |
 | 200 SADA22 audio samples | ~0.1 GB |
 | LoRA checkpoint | ~0.2 GB |
 | **Total** | **~5–6 GB ✓** |

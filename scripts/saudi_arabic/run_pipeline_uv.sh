@@ -22,7 +22,7 @@
 #   DIALECT   - SADA22 dialect value (default: "Najdi")
 #   MAX_SAMPLES - number of samples to download (default: 200)
 #   MAX_STEPS   - LoRA training steps (default: 50)
-#   BASE_MODEL  - HF model id (default: Qwen/Qwen3-TTS-0.6B-Base)
+#   BASE_MODEL  - HF model id (default: Qwen/Qwen3-TTS-12Hz-0.6B-Base)
 #   DATA_DIR    - root data directory (default: data/sada22_small)
 # =============================================================================
 set -euo pipefail
@@ -32,7 +32,7 @@ SPEAKER="${SPEAKER:-Speaker1متحدث}"
 DIALECT="${DIALECT:-Najdi}"
 MAX_SAMPLES="${MAX_SAMPLES:-200}"
 MAX_STEPS="${MAX_STEPS:-50}"
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-TTS-0.6B-Base}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}"
 
 DATA_RAW="${DATA_DIR:-data/sada22_small}"
 DATA_PROCESSED="${DATA_RAW}_qwen3tts"
@@ -97,7 +97,7 @@ if [[ "$HF_AUTH_OK" != "yes" ]]; then
     echo "  Qwen3-TTS and SADA22 require a HuggingFace access token."
     echo "  Fix: .venv/bin/huggingface-cli login"
     echo "  Or:  export HF_TOKEN=hf_xxxx && bash scripts/saudi_arabic/run_pipeline_uv.sh"
-    echo "  Accept license at: https://huggingface.co/Qwen/Qwen3-TTS-0.6B-Base"
+    echo "  Accept license at: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     exit 1
 fi
 ok "HuggingFace authenticated."

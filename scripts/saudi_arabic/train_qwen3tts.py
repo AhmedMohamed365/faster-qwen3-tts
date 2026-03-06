@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--train-jsonl", type=Path, default=Path("data/sada22_qwen3tts/train_qwen3tts_sft.jsonl"))
     p.add_argument("--val-jsonl", type=Path, default=Path("data/sada22_qwen3tts/val_qwen3tts_sft.jsonl"))
-    p.add_argument("--base-model", type=str, default="Qwen/Qwen3-TTS-0.6B-Base")
+    p.add_argument("--base-model", type=str, default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
     p.add_argument("--output-dir", type=Path, default=Path("outputs/qwen3tts-sada22"))
     p.add_argument("--mode", choices=["full", "lora"], default="lora")
     p.add_argument("--epochs", type=int, default=3)

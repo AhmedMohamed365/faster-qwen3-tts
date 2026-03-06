@@ -18,6 +18,6 @@ python scripts/saudi_arabic/train_qwen3tts.py \
   --mode lora \
   --train-jsonl data/sada22_smoke_qwen3tts/train_qwen3tts_sft.jsonl \
   --val-jsonl data/sada22_smoke_qwen3tts/val_qwen3tts_sft.jsonl \
-  --base-model Qwen/Qwen3-TTS-0.6B-Base \
+  --base-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
   --trainer-entrypoint scripts.saudi_arabic.mock_trainer \
   --output-dir outputs/qwen3tts-sada22-smoke

@@ -12,7 +12,7 @@ Two checks are performed:
 
 Usage:
     python scripts/saudi_arabic/validate_finetuned.py \
-        --base-model   Qwen/Qwen3-TTS-0.6B-Base \
+        --base-model   Qwen/Qwen3-TTS-12Hz-0.6B-Base \
         --finetuned-model outputs/qwen3tts-sada22-lora \
         --val-jsonl    data/sada22_small_qwen3tts/val_manifest.jsonl \
         --output-dir   outputs/validate
@@ -307,7 +307,7 @@ def check_audio(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--base-model", default="Qwen/Qwen3-TTS-0.6B-Base")
+    p.add_argument("--base-model", default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
     p.add_argument("--finetuned-model", type=Path, default=Path("outputs/qwen3tts-sada22-lora"))
     p.add_argument("--val-jsonl", type=Path, default=Path("data/sada22_small_qwen3tts/val_manifest.jsonl"))
     p.add_argument("--output-dir", type=Path, default=Path("outputs/validate"))

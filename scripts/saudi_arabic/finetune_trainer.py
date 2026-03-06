@@ -14,7 +14,7 @@ Or directly:
     python scripts/saudi_arabic/finetune_trainer.py \
         --train-jsonl data/sada22_small_qwen3tts/train_qwen3tts_sft.jsonl \
         --val-jsonl   data/sada22_small_qwen3tts/val_qwen3tts_sft.jsonl \
-        --base-model  Qwen/Qwen3-TTS-0.6B-Base \
+        --base-model  Qwen/Qwen3-TTS-12Hz-0.6B-Base \
         --output-dir  outputs/qwen3tts-sada22-lora \
         --max-steps   50 \
         --mode        lora \
@@ -321,7 +321,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=Path, default=None, help="Path to JSON config written by train_qwen3tts.py")
     p.add_argument("--train-jsonl", type=Path)
     p.add_argument("--val-jsonl", type=Path)
-    p.add_argument("--base-model", type=str, default="Qwen/Qwen3-TTS-0.6B-Base")
+    p.add_argument("--base-model", type=str, default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
     p.add_argument("--output-dir", type=Path, default=Path("outputs/qwen3tts-sada22-lora"))
     p.add_argument("--mode", choices=["full", "lora"], default="lora")
     p.add_argument("--max-steps", type=int, default=50)
