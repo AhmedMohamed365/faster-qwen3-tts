@@ -38,6 +38,10 @@ MAX_STEPS="${MAX_STEPS:-50}"
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-TTS-0.6B-Base}"
 ROOT_DIR="${ROOT_DIR:-.}"
 
+# Kaggle-input dataset path — populated when the dataset is attached in Kaggle UI
+# (Add Data → search "sada2022" by sdaiancai → attach)
+KAGGLE_INPUT_DIR="${KAGGLE_INPUT_DIR:-/kaggle/input/datasets/sdaiancai/sada2022}"
+
 DATA_RAW="${DATA_DIR:-data/sada22_small}"
 DATA_PROCESSED="${DATA_RAW}_qwen3tts"
 OUTPUT_DIR="outputs/qwen3tts-sada22-lora"
@@ -114,19 +118,31 @@ if [[ -n "$MISSING" ]]; then
 fi
 ok "All required packages present."
 
-# HF authentication — Kaggle Secrets expose HF_TOKEN automatically if configured
-HF_AUTH_OK="yes"
+# Decide download source — prefer attached Kaggle dataset (faster, no HF needed)
+if [[ -f "$KAGGLE_INPUT_DIR/train.csv" ]]; then
+    DOWNLOAD_SOURCE="kaggle-input"
+    ok "Kaggle input dataset found at $KAGGLE_INPUT_DIR — will use local CSV (no HF download needed)."
+    HF_NEEDED_FOR_DATA=0
+else
+    DOWNLOAD_SOURCE="hf"
+    HF_NEEDED_FOR_DATA=1
+    info "No local dataset at $KAGGLE_INPUT_DIR — will stream from HuggingFace."
+    echo "  (Attach your Sada22 dataset in Kaggle: Add Data → search Sada22 → attach)"
+fi
 
-# HF_AUTH_OK=$("$PYTHON_BIN" -c "
-# from huggingface_hub import HfFolder
-# import os
-# t = HfFolder.get_token() or os.environ.get('HF_TOKEN','')
-# print('yes' if t else 'no')
-# " 2>/dev/null)
+# HF authentication — only strictly needed if streaming from HF.
+# Model weights always come from HF so check auth regardless.
+HF_AUTH_OK=$("$PYTHON_BIN" -c "
+from huggingface_hub import HfFolder
+import os
+t = HfFolder.get_token() or os.environ.get('HF_TOKEN','')
+print('yes' if t else 'no')
+" 2>/dev/null)
 
 if [[ "$HF_AUTH_OK" != "yes" ]]; then
     echo ""
     echo -e "${RED}✗ Not logged in to HuggingFace.${NC}"
+    echo "  Model weights ($BASE_MODEL) are always downloaded from HuggingFace."
     echo "  In Kaggle, run this in a notebook cell BEFORE the pipeline:"
     echo ""
     echo "    from kaggle_secrets import UserSecretsClient"
@@ -140,34 +156,40 @@ fi
 ok "HuggingFace authenticated."
 
 # =============================================================================
-# [2/6] Download SADA22 (speaker + dialect filter, stops at MAX_SAMPLES)
+# [2/6] Prepare SADA22 data (local Kaggle input or HF streaming)
 # =============================================================================
-info "[2/6] Downloading SADA22 (${MAX_SAMPLES} samples, speaker='${SPEAKER}', dialect='${DIALECT}') …"
-echo "  Tip: our streaming downloader stops as soon as ${MAX_SAMPLES} matching rows are found"
-echo "  — it does NOT scan all 28 shards, keeping disk usage minimal."
+if [[ "$DOWNLOAD_SOURCE" == "kaggle-input" ]]; then
+    info "[2/6] Filtering SADA22 from local dataset (speaker='${SPEAKER}', dialect='${DIALECT}', max=${MAX_SAMPLES}) …"
+    echo "  Source: $KAGGLE_INPUT_DIR/train.csv  [no internet needed]"
+else
+    info "[2/6] Streaming SADA22 from HuggingFace (${MAX_SAMPLES} rows, speaker='${SPEAKER}', dialect='${DIALECT}') …"
+    echo "  Tip: streaming stops as soon as ${MAX_SAMPLES} matching rows are found."
+fi
 echo ""
 disk_check
 
 if [[ -f "$DATA_RAW/download_manifest.json" ]]; then
     EXISTING_ROWS=$("$PYTHON_BIN" -c "import json; d=json.load(open('$DATA_RAW/download_manifest.json')); print(d.get('rows',0))" 2>/dev/null || echo 0)
     if [[ "$EXISTING_ROWS" -ge "$MAX_SAMPLES" ]]; then
-        ok "Data already downloaded ($EXISTING_ROWS rows). Skipping."
+        ok "Data already prepared ($EXISTING_ROWS rows). Skipping."
     else
-        info "Existing data has only $EXISTING_ROWS rows; re-downloading …"
+        info "Existing data has only $EXISTING_ROWS rows; re-preparing …"
         run_py scripts/saudi_arabic/download_sada22.py \
-            --source hf \
-            --max-samples "$MAX_SAMPLES" \
-            --speaker     "$SPEAKER" \
-            --dialect     "$DIALECT" \
-            --output-dir  "$DATA_RAW"
+            --source       "$DOWNLOAD_SOURCE" \
+            --kaggle-input-dir "$KAGGLE_INPUT_DIR" \
+            --max-samples  "$MAX_SAMPLES" \
+            --speaker      "$SPEAKER" \
+            --dialect      "$DIALECT" \
+            --output-dir   "$DATA_RAW"
     fi
 else
     run_py scripts/saudi_arabic/download_sada22.py \
-        --source hf \
-        --max-samples "$MAX_SAMPLES" \
-        --speaker     "$SPEAKER" \
-        --dialect     "$DIALECT" \
-        --output-dir  "$DATA_RAW"
+        --source       "$DOWNLOAD_SOURCE" \
+        --kaggle-input-dir "$KAGGLE_INPUT_DIR" \
+        --max-samples  "$MAX_SAMPLES" \
+        --speaker      "$SPEAKER" \
+        --dialect      "$DIALECT" \
+        --output-dir   "$DATA_RAW"
 fi
 
 DOWNLOADED_ROWS=$("$PYTHON_BIN" -c "import json; d=json.load(open('$DATA_RAW/download_manifest.json')); print(d['rows'])")

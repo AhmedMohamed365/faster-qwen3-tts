@@ -25,70 +25,61 @@ def _load_hf_subset(
     from datasets import Audio, Dataset, load_dataset
     from tqdm import tqdm
 
+    DATASET_ID = "MohamedRashad/SADA22"
+
     print(f"  Streaming SADA22 — scanning for speaker={speaker!r}, dialect={dialect!r} ...")
     print("  (Each of the 28 shards may be 100–500 MB; this can take several minutes)")
 
-    # Stream WITHOUT audio so each row is just metadata — much faster to scan.
-    stream = load_dataset("MohamedRashad/SADA22", split="train", revision=revision, streaming=True)
-    audio_cols = [c for c in stream.features if "audio" in c.lower()]
+    # ── PASS 1: scan metadata — NO audio decoding ─────────────────────────────
+    # Detect Audio columns by feature TYPE (not name) so we never miss them.
+    stream = load_dataset(DATASET_ID, split="train", revision=revision, streaming=True)
+    audio_cols = [col for col, feat in stream.features.items() if isinstance(feat, Audio)]
     if audio_cols:
+        # Cast to decode=False BEFORE iterating — this prevents torchcodec from
+        # being called. remove_columns() alone doesn't help because datasets
+        # decodes first, then removes.
+        for col in audio_cols:
+            stream = stream.cast_column(col, Audio(decode=False))
         stream = stream.remove_columns(audio_cols)
 
-    matched_rows: list = []
+    matched_indices: list[int] = []
     scanned = 0
     with tqdm(desc="  Scanning rows", unit=" rows", dynamic_ncols=True) as pbar:
-        for row in stream:
+        for idx, row in enumerate(stream):
             scanned += 1
             pbar.update(1)
-            pbar.set_postfix(matched=len(matched_rows), refresh=False)
-            # Speaker / dialect filtering (uses SADA22's actual column names).
-            if speaker and row.get("Speaker") != speaker:
+            pbar.set_postfix(matched=len(matched_indices), refresh=False)
+            spk = (row.get("Speaker") or "").strip()
+            dia = (row.get("SpeakerDialect") or "").strip()
+            if speaker and spk != speaker:
                 continue
-            if dialect and row.get("SpeakerDialect") != dialect:
+            if dialect and dia != dialect:
                 continue
-            matched_rows.append(row)
-            if max_samples and len(matched_rows) >= max_samples:
+            matched_indices.append(idx)
+            if max_samples and len(matched_indices) >= max_samples:
                 break
 
-    if not matched_rows:
+    if not matched_indices:
         raise SystemExit(
             f"No rows matched speaker={speaker!r} dialect={dialect!r} after scanning {scanned} rows."
         )
 
-    print(f"  Found {len(matched_rows)} matching rows out of {scanned} scanned.")
-    print("  Building Dataset and fetching audio for matched rows ...")
+    print(f"  Found {len(matched_indices)} matching rows out of {scanned} scanned.")
+    print(f"  Fetching audio for {len(matched_indices)} matched rows ...")
 
-    # Build metadata-only Dataset, then fetch audio for just those rows.
-    meta_ds = Dataset.from_list(matched_rows)
+    # ── PASS 2: fetch only the matched rows with raw audio bytes ──────────────
+    # select() jumps directly to those indices — no full-dataset rescan needed.
+    full_stream = load_dataset(DATASET_ID, split="train", revision=revision, streaming=True)
+    for col in [c for c, f in full_stream.features.items() if isinstance(f, Audio)]:
+        full_stream = full_stream.cast_column(col, Audio(decode=False))  # raw bytes, no torchcodec
+    full_stream = full_stream.select(matched_indices)
 
-    # Re-stream to collect audio bytes only for matched rows (by text key).
-    text_col = "ProcessedText" if "ProcessedText" in meta_ds.column_names else "text"
-    matched_texts = set(meta_ds[text_col]) if text_col in meta_ds.column_names else set()
+    rows: list = []
+    for row in tqdm(full_stream, total=len(matched_indices), desc="  Fetching audio", dynamic_ncols=True):
+        rows.append(row)
 
-    audio_stream = load_dataset(
-        "MohamedRashad/SADA22", split="train", revision=revision, streaming=True
-    )
-    audio_stream = audio_stream.cast_column("audio", Audio(decode=False))
-
-    audio_map: dict = {}
-    needed = len(matched_rows)
-    with tqdm(desc="  Fetching audio", unit=" rows", total=needed, dynamic_ncols=True) as pbar2:
-        for row in audio_stream:
-            key = row.get(text_col, "")
-            if key in matched_texts and key not in audio_map:
-                audio_map[key] = row.get("audio")
-                pbar2.update(1)
-                if len(audio_map) >= needed:
-                    break
-
-    # Attach audio bytes back to metadata rows.
-    rows_with_audio = []
-    for r in matched_rows:
-        key = r.get(text_col, "")
-        rows_with_audio.append({**r, "audio": audio_map.get(key)})
-
-    label = f"train[speaker={speaker or 'all'},dialect={dialect or 'all'},n={len(rows_with_audio)}]"
-    return Dataset.from_list(rows_with_audio), label
+    label = f"train[speaker={speaker or 'all'},dialect={dialect or 'all'},n={len(rows)}]"
+    return Dataset.from_list(rows), label
 
 
 def download_hf(
@@ -127,6 +118,143 @@ def download_hf(
     (output_dir / "download_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def load_kaggle_input(
+    kaggle_input_dir: Path,
+    output_dir: Path,
+    max_samples: int | None,
+    speaker: str | None,
+    dialect: str | None,
+) -> None:
+    """Build a HuggingFace Dataset from the pre-mounted Kaggle input dataset.
+
+    Expects the layout::
+
+        /kaggle/input/Sada22/
+            train.csv          ← 11 columns (no header) or named header
+            batch_1/*.wav
+            batch_2/*.wav
+            ...
+
+    Column order when headerless:
+        audio_path, ProcessedText, TotalDuration, SegmentName,
+        SegmentDuration, StartTime, EndTime, AgeGroup, Gender,
+        SpeakerDialect, Speaker
+    """
+    import pandas as pd
+    from datasets import Dataset, DatasetDict
+    from tqdm import tqdm
+
+    COLS_NO_HEADER = [
+        "audio_path", "ProcessedText", "TotalDuration", "SegmentName",
+        "SegmentDuration", "StartTime", "EndTime", "AgeGroup", "Gender",
+        "SpeakerDialect", "Speaker",
+    ]
+
+    csv_path = kaggle_input_dir / "train.csv"
+    if not csv_path.exists():
+        raise SystemExit(f"train.csv not found at {csv_path}")
+
+    # Auto-detect header: peek at the first cell
+    with open(csv_path, encoding="utf-8") as fh:
+        first_cell = fh.readline().split(",")[0].strip().lower()
+    has_header = first_cell in ("audio_path", "audio", "filepath", "path", "processedtext")
+
+    if has_header:
+        df = pd.read_csv(csv_path)
+    else:
+        df = pd.read_csv(csv_path, header=None)
+        ncols = df.shape[1]
+        if ncols == len(COLS_NO_HEADER):
+            df.columns = COLS_NO_HEADER
+        elif ncols == len(COLS_NO_HEADER) + 1:
+            # Leading row-index column emitted by some exporters
+            df.columns = ["_idx"] + COLS_NO_HEADER
+            df = df.drop(columns=["_idx"])
+        else:
+            raise SystemExit(
+                f"train.csv has {ncols} columns — expected {len(COLS_NO_HEADER)} or "
+                f"{len(COLS_NO_HEADER) + 1} (with leading index).\n"
+                f"First row: {list(df.iloc[0])}"
+            )
+
+    # Flexible column lookup (case-insensitive)
+    col_map = {c.lower(): c for c in df.columns}
+
+    def find_col(*candidates: str) -> str | None:
+        for name in candidates:
+            if name.lower() in col_map:
+                return col_map[name.lower()]
+        return None
+
+    audio_col = find_col("audio_path", "audio", "filepath", "path")
+    text_col  = find_col("processedtext", "text", "transcript")
+    spk_col   = find_col("speaker", "speaker_id")
+    dia_col   = find_col("speakerdialect", "dialect")
+
+    if not audio_col:
+        raise SystemExit(f"Cannot find audio column. Columns present: {list(df.columns)}")
+
+    # ── Filter ────────────────────────────────────────────────────────────────
+    if speaker and spk_col:
+        df = df[df[spk_col].astype(str).str.strip() == speaker.strip()]
+    if dialect and dia_col:
+        df = df[df[dia_col].astype(str).str.strip() == dialect.strip()]
+    if len(df) == 0:
+        raise SystemExit(
+            f"No rows matched speaker={speaker!r} dialect={dialect!r}.\n"
+            f"Available speakers: {list(df[spk_col].unique()) if spk_col else 'unknown'}"
+        )
+    if max_samples:
+        df = df.head(max_samples)
+
+    print(f"  Found {len(df)} matching rows (speaker={speaker!r}, dialect={dialect!r}).")
+    print("  Building dataset — referencing audio by path (no copy needed) ...")
+
+    # ── Build rows — audio stored as path dict ────────────────────────────────
+    # preprocess_sada22.py already handles {"path": ..., "bytes": None} format.
+    extra_cols = [c for c in df.columns if c not in [audio_col, text_col, spk_col, dia_col]]
+    rows: list[dict] = []
+    missing = 0
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="  Indexing rows"):
+        audio_path = kaggle_input_dir / str(row[audio_col]).lstrip("/")
+        if not audio_path.exists():
+            missing += 1
+            continue
+        entry: dict = {
+            "audio": {"path": str(audio_path), "bytes": None},
+            "ProcessedText": str(row[text_col]) if text_col else "",
+            "Speaker":        str(row[spk_col])  if spk_col  else "",
+            "SpeakerDialect": str(row[dia_col])  if dia_col  else "",
+        }
+        for c in extra_cols:
+            entry[c] = str(row.get(c, ""))
+        rows.append(entry)
+
+    if missing:
+        print(f"  Warning: {missing} audio file(s) not found on disk — skipped.")
+    if not rows:
+        raise SystemExit("No valid audio entries after path check.")
+
+    # ── Save to disk as HuggingFace Dataset ───────────────────────────────────
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ds = Dataset.from_list(rows)
+    DatasetDict({"train": ds}).save_to_disk(str(output_dir))
+
+    manifest = {
+        "source": "kaggle-input",
+        "input_dir": str(kaggle_input_dir.resolve()),
+        "csv": str(csv_path),
+        "speaker_filter": speaker,
+        "dialect_filter": dialect,
+        "rows": len(rows),
+        "saved_to": str(output_dir.resolve()),
+    }
+    (output_dir / "download_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(f"  ✓ Saved {len(rows)} rows → {output_dir}")
+
+
 def download_kaggle(output_dir: Path, kaggle_dataset: str) -> None:
     if shutil.which("kaggle") is None:
         raise SystemExit(
@@ -152,7 +280,13 @@ def download_kaggle(output_dir: Path, kaggle_dataset: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("data/sada22"))
-    parser.add_argument("--source", choices=["hf", "kaggle"], default="hf")
+    parser.add_argument("--source", choices=["hf", "kaggle", "kaggle-input"], default="hf")
+    parser.add_argument(
+        "--kaggle-input-dir",
+        type=Path,
+        default=Path("/kaggle/input/datasets/sdaiancai/sada2022"),
+        help="Path to the pre-mounted Kaggle input dataset (used with --source kaggle-input)",
+    )
     parser.add_argument("--revision", type=str, default=None, help="HF revision/commit for reproducibility")
     parser.add_argument(
         "--max-samples",
@@ -186,6 +320,8 @@ def main() -> None:
 
     if args.source == "hf":
         download_hf(args.output_dir, args.revision, args.max_samples, speaker=args.speaker, dialect=args.dialect)
+    elif args.source == "kaggle-input":
+        load_kaggle_input(args.kaggle_input_dir, args.output_dir, args.max_samples, speaker=args.speaker, dialect=args.dialect)
     else:
         download_kaggle(args.output_dir, args.kaggle_dataset)
 

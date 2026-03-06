@@ -68,6 +68,8 @@ info "Installing training deps (transformers, peft, datasets, accelerate …) �
     "torchaudio" \
     "tqdm" \
     "huggingface_hub"
+# torchcodec: needed by newer datasets for Audio decoding — non-fatal if it fails
+"$PIP" install --quiet torchcodec 2>/dev/null || true
 ok "Training deps installed"
 
 # ── 6. Install the faster-qwen3-tts package ───────────────────────────────────
