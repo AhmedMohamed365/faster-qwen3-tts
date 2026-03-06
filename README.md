@@ -408,6 +408,76 @@ The speaker embedding is a 4KB file (2048-dim bf16 vector). In `x_vector_only` m
 - **Shorter prefill**: 10 tokens vs ~80+ in full ICL clone mode
 - **No ref audio at runtime**: just the 4KB embedding file
 
+## Saudi Arabic Fine-tuning on Kaggle
+
+Fine-tune Qwen3-TTS on [SADA22](https://huggingface.co/datasets/Saudi-NLP/sada22) using LoRA in a free Kaggle GPU session (P100 / T4, 20 GB disk).
+
+### Prerequisites
+
+- Accept the model license: <https://huggingface.co/Qwen/Qwen3-TTS-0.6B-Base>
+- Add your HuggingFace token as a Kaggle Secret named **`HF_TOKEN`**
+  *(Notebook → Add-ons → Secrets → + Add secret)*
+
+### Setup (run once per session)
+
+**Cell 1 — clone & initialise the conda environment:**
+
+```python
+!git clone https://github.com/your-org/faster-qwen3-tts .
+!bash scripts/intialize_kaggle.sh
+```
+
+**Cell 2 — authenticate with HuggingFace:**
+
+```python
+from kaggle_secrets import UserSecretsClient
+from huggingface_hub import login
+
+login(token=UserSecretsClient().get_secret("HF_TOKEN"))
+```
+
+**Cell 3 — run the full pipeline:**
+
+```python
+!bash scripts/saudi_arabic/run_pipeline_kaggle.sh
+```
+
+This single command:
+1. Streams only the shards needed to collect 200 `Speaker1متحدث` / Najdi rows (stops early — does **not** download all 28 shards)
+2. Resamples audio to 24 kHz and builds train/val manifests
+3. Constructs SFT JSONL pairs
+4. Runs LoRA fine-tuning (50 steps by default, bf16 if GPU supports it)
+5. Validates with a loss-curve check and base vs fine-tuned audio comparison
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `SPEAKER` | `Speaker1متحدث` | SADA22 speaker id to filter |
+| `DIALECT` | `Najdi` | SADA22 dialect to filter |
+| `MAX_SAMPLES` | `200` | Rows to download |
+| `MAX_STEPS` | `50` | LoRA training steps |
+| `BASE_MODEL` | `Qwen/Qwen3-TTS-0.6B-Base` | HF model id |
+
+Override any variable inline:
+
+```python
+import os
+os.environ["MAX_STEPS"] = "200"
+os.environ["MAX_SAMPLES"] = "500"
+!bash scripts/saudi_arabic/run_pipeline_kaggle.sh
+```
+
+### Disk budget (20 GB Kaggle limit)
+
+| Item | Size |
+|---|---|
+| Conda env + packages | ~3 GB |
+| Qwen3-TTS-0.6B-Base weights | ~2 GB |
+| 200 SADA22 audio samples | ~0.1 GB |
+| LoRA checkpoint | ~0.2 GB |
+| **Total** | **~5–6 GB ✓** |
+
 ## License
 
 MIT
