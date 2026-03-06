@@ -39,6 +39,72 @@ TARGET_SR = 24_000
 
 
 # ---------------------------------------------------------------------------
+# Model-cache fix — preprocessor_config.json in speech_tokenizer/
+# ---------------------------------------------------------------------------
+
+def _ensure_speech_tokenizer_preprocessor(snapshot_dir: str) -> None:
+    """
+    Copy preprocessor_config.json from the snapshot root into the
+    speech_tokenizer/ sub-directory when it is missing there.
+
+    AutoFeatureExtractor.from_pretrained resolves the cached model path to
+    <snapshot>/speech_tokenizer and then expects preprocessor_config.json
+    inside that sub-directory.  Some versions of qwen-tts / transformers
+    only place the file at the snapshot root, causing:
+
+        OSError: Can't load feature extractor … make sure
+                 'speech_tokenizer' is the correct path to a directory
+                 containing a preprocessor_config.json file
+    """
+    import shutil as _shutil
+    snapshot = Path(snapshot_dir)
+    root_cfg = snapshot / "preprocessor_config.json"
+    sub_dir  = snapshot / "speech_tokenizer"
+    sub_cfg  = sub_dir / "preprocessor_config.json"
+
+    if not sub_dir.is_dir() or sub_cfg.exists():
+        return  # nothing to do
+
+    if root_cfg.exists():
+        log.info(
+            "Copying preprocessor_config.json → speech_tokenizer/ "
+            "(work-around for qwen_tts AutoFeatureExtractor path bug)"
+        )
+        _shutil.copy2(str(root_cfg), str(sub_cfg))
+    else:
+        log.warning(
+            "preprocessor_config.json not found at snapshot root (%s). "
+            "Model loading may fail.",
+            snapshot_dir,
+        )
+
+
+def _resolve_model_path(model_id: str, hf_token: str | None = None) -> str:
+    """
+    If *model_id* is a HuggingFace Hub ID (not a local path), pre-download
+    the snapshot with huggingface_hub and patch the cache if needed.
+    Returns the local snapshot directory to pass to from_pretrained.
+    """
+    if Path(model_id).exists():
+        _ensure_speech_tokenizer_preprocessor(model_id)
+        return model_id
+
+    try:
+        from huggingface_hub import snapshot_download as _snap
+        log.info("Pre-downloading / validating snapshot for %s …", model_id)
+        snapshot_dir = _snap(
+            model_id,
+            token=hf_token,
+            ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
+        )
+        _ensure_speech_tokenizer_preprocessor(snapshot_dir)
+        return snapshot_dir
+    except Exception as _e:
+        log.warning("snapshot_download failed (%s); will attempt direct load …", _e)
+        return model_id
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -130,8 +196,9 @@ def _load_base_and_generate(model_path: str, text: str, ref_audio_path: str, out
 
     log.info("Loading model from %s …", model_path)
     _hf_token = os.environ.get("HF_TOKEN") or None
+    load_path = _resolve_model_path(model_path, _hf_token)
     with torch.no_grad():
-        model = Qwen3TTSModel.from_pretrained(model_path, torch_dtype=dtype, token=_hf_token).to(device)
+        model = Qwen3TTSModel.from_pretrained(load_path, torch_dtype=dtype, token=_hf_token).to(device)
         model.eval()
 
         # Build voice clone prompt from reference audio (xvec only = fast)
@@ -205,7 +272,8 @@ def _load_finetuned_and_generate(
 
     log.info("Loading base model + LoRA adapter from %s …", finetuned_dir)
     _hf_token = os.environ.get("HF_TOKEN") or None
-    model = Qwen3TTSModel.from_pretrained(base_model, torch_dtype=dtype, token=_hf_token).to(device)
+    load_path = _resolve_model_path(base_model, _hf_token)
+    model = Qwen3TTSModel.from_pretrained(load_path, torch_dtype=dtype, token=_hf_token).to(device)
     model.eval()
 
     # Apply LoRA adapter to the talker

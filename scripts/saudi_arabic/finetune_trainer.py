@@ -234,6 +234,49 @@ class TalkerCollator:
 # Model loading helpers
 # ---------------------------------------------------------------------------
 
+def _ensure_speech_tokenizer_preprocessor(snapshot_dir: str) -> None:
+    """
+    Work-around for a qwen_tts bug on Kaggle / local HF cache:
+
+    AutoFeatureExtractor.from_pretrained(snapshot_dir) resolves the model
+    to the *speech_tokenizer/* sub-directory and then looks for
+    preprocessor_config.json inside that sub-directory.  On some versions of
+    the qwen-tts library / transformers the file is only present at the root
+    of the snapshot, not inside speech_tokenizer/, which triggers:
+
+        OSError: Can't load feature extractor … make sure '…/speech_tokenizer'
+                 is the correct path to a directory containing a
+                 preprocessor_config.json file
+
+    Fix: if preprocessor_config.json is absent from speech_tokenizer/ but
+    present at the root of the snapshot, copy (or symlink) it across.
+    """
+    import shutil as _shutil
+    snapshot = Path(snapshot_dir)
+    root_cfg = snapshot / "preprocessor_config.json"
+    sub_dir  = snapshot / "speech_tokenizer"
+    sub_cfg  = sub_dir / "preprocessor_config.json"
+
+    if not sub_dir.is_dir():
+        return  # nothing to fix — sub-dir hasn't been created yet
+
+    if sub_cfg.exists():
+        return  # already present — nothing to do
+
+    if root_cfg.exists():
+        log.info(
+            "Copying preprocessor_config.json → speech_tokenizer/ "
+            "(work-around for qwen_tts AutoFeatureExtractor path bug)"
+        )
+        _shutil.copy2(str(root_cfg), str(sub_cfg))
+    else:
+        log.warning(
+            "preprocessor_config.json not found at snapshot root (%s). "
+            "Model loading may fail.",
+            snapshot_dir,
+        )
+
+
 def load_model_and_components(base_model: str, bf16: bool):
     """
     Load Qwen3TTSModel via qwen_tts.
@@ -260,8 +303,32 @@ def load_model_and_components(base_model: str, bf16: bool):
     import os as _os
     _hf_token = _os.environ.get("HF_TOKEN") or None
 
+    # ── Pre-download snapshot and apply cache fix ──────────────────────────
+    # huggingface_hub.snapshot_download() will re-use whatever is already in
+    # the cache (fast path), then we patch speech_tokenizer/ if needed.
+    # We only do this for Hub model IDs (not local paths).
+    if not Path(base_model).exists():
+        try:
+            from huggingface_hub import snapshot_download as _snapshot_dl
+            log.info("Pre-downloading / validating snapshot for %s …", base_model)
+            snapshot_dir = _snapshot_dl(
+                base_model,
+                token=_hf_token,
+                ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
+            )
+            _ensure_speech_tokenizer_preprocessor(snapshot_dir)
+            # Load from local snapshot directory to avoid re-resolving the path
+            load_path: str = snapshot_dir
+        except Exception as _e:
+            log.warning("snapshot_download failed (%s); attempting direct load …", _e)
+            load_path = base_model
+    else:
+        # base_model is already a local directory path
+        _ensure_speech_tokenizer_preprocessor(base_model)
+        load_path = base_model
+
     wrapper = Qwen3TTSModel.from_pretrained(
-        base_model,
+        load_path,
         torch_dtype=dtype,
         device_map=device,
         token=_hf_token,
@@ -281,7 +348,7 @@ def load_model_and_components(base_model: str, bf16: bool):
     if text_tokenizer is None:
         # Fallback: use AutoTokenizer with the same path
         from transformers import AutoTokenizer
-        text_tokenizer = AutoTokenizer.from_pretrained(base_model)
+        text_tokenizer = AutoTokenizer.from_pretrained(load_path)
 
     log.info("Talker type: %s", type(talker).__name__)
     log.info("Speech tokenizer type: %s", type(speech_tokenizer).__name__)

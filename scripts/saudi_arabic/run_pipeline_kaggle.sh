@@ -15,13 +15,13 @@
 #   DIALECT     - SADA22 dialect        (default: "Najdi")
 #   MAX_SAMPLES - rows to download      (default: 200)
 #   MAX_STEPS   - LoRA training steps   (default: 50)
-#   BASE_MODEL  - HF model id           (default: Qwen/Qwen3-TTS-12Hz-0.6B-Base)
+#   BASE_MODEL  - HF model id           (default: Qwen/Qwen3-TTS-0.6B-Base)
 #   DATA_DIR    - data root             (default: data/sada22_small)
 #   ROOT_DIR    - miniconda root        (default: .)
 #   HF_TOKEN    - HuggingFace token     (or set via Kaggle Secrets → Add-ons)
 #
 # Disk budget (Kaggle = 20 GB):
-#   ~2 GB  Qwen3-TTS-0.6B-Base weights
+#   ~2 GB  Qwen3-TTS-12Hz-0.6B-Base weights
 #   ~0.1GB 200 SADA22 audio samples
 #   ~0.2GB LoRA checkpoint
 #   ~3 GB  conda env + packages
@@ -35,7 +35,7 @@ SPEAKER="${SPEAKER:-Speaker1متحدث}"
 DIALECT="${DIALECT:-Najdi}"
 MAX_SAMPLES="${MAX_SAMPLES:-200}"
 MAX_STEPS="${MAX_STEPS:-50}"
-BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}"
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen3-TTS-0.6B-Base}"
 ROOT_DIR="${ROOT_DIR:-.}"
 
 # Kaggle-input dataset path — populated when the dataset is attached in Kaggle UI
@@ -167,7 +167,7 @@ if [[ "$HF_AUTH_OK" != "yes" ]]; then
     echo "    login(token=UserSecretsClient().get_secret('HF_TOKEN'))"
     echo ""
     echo "  Add your token: Notebook → Add-ons → Secrets → HF_TOKEN"
-    echo "  Accept model license: https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    echo "  Accept model license: https://huggingface.co/Qwen/Qwen3-TTS-0.6B-Base"
     exit 1
 fi
 ok "HuggingFace authenticated."
