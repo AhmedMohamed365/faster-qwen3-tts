@@ -26,7 +26,7 @@ def main() -> None:
             if not line.strip():
                 continue
             rec = json.loads(line)
-            audio_path = (base / rec["audio"]).as_posix()
+            audio_path = (base / rec["audio"]).resolve().as_posix()
 
             sample = {
                 "id": rec["id"],

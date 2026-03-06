@@ -211,9 +211,17 @@ class TalkerCollator:
             labels_list.append(torch.tensor(lab_ids, dtype=torch.long))
 
         if not input_ids_list:
-            # Return a dummy batch so Trainer doesn't crash on a bad batch
-            dummy = torch.zeros(1, 4, dtype=torch.long)
-            return {"input_ids": dummy, "labels": dummy.clone(), "attention_mask": torch.ones(1, 4)}
+            # All samples in this batch failed to load — return a zero-loss
+            # placeholder so Trainer doesn't crash.  Using a real pad_token_id
+            # keeps input valid for the model; all-(-100) labels means no
+            # gradient is computed and the step is effectively a no-op.
+            pad_id = self.tok.pad_token_id or 0
+            dummy = torch.full((1, 4), pad_id, dtype=torch.long)
+            return {
+                "input_ids": dummy,
+                "labels": torch.full((1, 4), -100, dtype=torch.long),
+                "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            }
 
         # Pad to longest in batch
         max_len = max(t.size(0) for t in input_ids_list)
@@ -520,7 +528,7 @@ def main() -> None:
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
-        tokenizer=text_tokenizer,
+        processing_class=text_tokenizer,
     )
 
     log.info("Starting training: max_steps=%s, batch=%s, grad_accum=%s",
