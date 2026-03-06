@@ -84,7 +84,10 @@ def load_speech_tokenizer(base_model: str):
     speech_tok = wrapper.model.speech_tokenizer
     if speech_tok is None:
         raise RuntimeError("speech_tokenizer is None after from_pretrained")
-    speech_tok.eval()
+    # speech_tokenizer may be a tokenizer object (not nn.Module), so only call
+    # eval() if it actually has that method (i.e. it's a torch module).
+    if hasattr(speech_tok, "eval"):
+        speech_tok.eval()
     return speech_tok
 
 
